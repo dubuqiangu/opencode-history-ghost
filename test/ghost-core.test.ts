@@ -6,7 +6,7 @@
  * 必须同时兼容 bun 与 node(tsx) 双运行时：`bun test/ghost-core.test.ts`
  * 与 `npx tsx test/ghost-core.test.ts`。
  *
- * 5 个用例（oracle 第四轮审查 P0 清单）：
+ * 5 个原始用例（oracle 第四轮审查 P0 清单）及真实 SDK 回归：
  *   1. suggestion-store：dismiss 只压制被取消的那一个输入；输入变化后立即恢复
  *      （dismissedForInput 单输入语义 + re-arm）。
  *   2. suggestion-store：增量快路径逐字延长输入时 candidates 数组引用严格不变、
@@ -27,6 +27,9 @@ import * as nodePath from "node:path"
 import { createHistorySource, type HistoryEntry } from "../src/history-source"
 import { createSuggestionStore, type HistoryGhostSettings } from "../src/suggestion-store"
 import { createEditorBridge, runIntegrityPollOnce } from "../src/editor-bridge"
+import { createTestRenderer } from "@opentui/core/testing"
+import { TextareaRenderable } from "@opentui/core"
+import { render } from "@opentui/solid"
 
 let failedAssertionCount = 0
 
@@ -89,7 +92,7 @@ function makeFakeEditBuffer(
   }
 }
 
-/** 可变焦点槽：宿主 renderer.currentFocusedEditor() 的可编程替身。 */
+/** 可变焦点槽：宿主 renderer.currentFocusedEditor getter 的可编程替身。 */
 interface FocusedEditorHolder {
   editor: MutableFakeEditBuffer | null
 }
@@ -97,7 +100,7 @@ interface FocusedEditorHolder {
 function makeHostContext(holder: FocusedEditorHolder): unknown {
   return {
     renderer: {
-      currentFocusedEditor: () => holder.editor,
+      get currentFocusedEditor() { return holder.editor },
     },
   }
 }
@@ -245,6 +248,124 @@ function runWrapperMigrationGuardScenario(): void {
   bridge.dispose()
 }
 
+/** 真实 SDK getter + 真实 textarea 的两个 listener 槽位：有宿主监听与空槽均须正确安装。 */
+async function runRealRendererHookScenario(withHostListeners: boolean): Promise<void> {
+  const testSetup = await createTestRenderer({ width: 110, height: 10 })
+  const { renderer } = testSetup
+  const hostContentCalls = { count: 0 }
+  const hostCursorCalls = { count: 0 }
+  const inputCalls = { count: 0 }
+  const caretCalls = { count: 0 }
+  const textarea = new TextareaRenderable(renderer, {
+    id: withHostListeners ? "with-host-listeners" : "empty-listener-slots",
+    width: 100,
+    height: 2,
+    onContentChange: withHostListeners ? () => { hostContentCalls.count += 1 } : undefined,
+    onCursorChange: withHostListeners ? () => { hostCursorCalls.count += 1 } : undefined,
+  })
+  const initialContentListener = textarea.onContentChange
+  const initialCursorListener = textarea.onCursorChange
+  if (!withHostListeners) {
+    assertEqual("真实 textarea 初始 content 槽为空", initialContentListener, undefined)
+    assertEqual("真实 textarea 初始 cursor 槽为空", initialCursorListener, undefined)
+  }
+  let bridge: ReturnType<typeof createEditorBridge> | undefined
+  try {
+    renderer.root.add(textarea)
+    textarea.focus()
+    bridge = createEditorBridge({ renderer })
+    assertTruthy("真实 renderer getter 指向 textarea", bridge.current() === textarea)
+    bridge.onInput(() => { inputCalls.count += 1 })
+    bridge.onCaretMove(() => { caretCalls.count += 1 })
+    assertTruthy("真实 textarea 首次安装 content wrapper", typeof textarea.onContentChange === "function")
+    assertTruthy("真实 textarea 首次安装 cursor wrapper", typeof textarea.onCursorChange === "function")
+    textarea.insertText("hel")
+    await testSetup.renderOnce()
+    assertTruthy("真实 textarea 输入通知到达 bridge", inputCalls.count > 0)
+    assertTruthy("真实 textarea 光标通知到达 bridge", caretCalls.count > 0)
+    if (withHostListeners) {
+      assertTruthy("宿主 content listener 仍收到事件", hostContentCalls.count > 0)
+      assertTruthy("宿主 cursor listener 仍收到事件", hostCursorCalls.count > 0)
+    }
+    const priorContentCalls = inputCalls.count
+    const priorCaretCalls = caretCalls.count
+    runIntegrityPollOnce(bridge)
+    textarea.insertText("p")
+    await testSetup.renderOnce()
+    assertEqual("轮询不重复包装 content", inputCalls.count, priorContentCalls + 1)
+    assertTruthy("轮询不丢 cursor", caretCalls.count > priorCaretCalls)
+    textarea.blur()
+    const previousWarn = console.warn
+    const pollWarnings: unknown[][] = []
+    console.warn = (...warningArguments: unknown[]) => { pollWarnings.push(warningArguments) }
+    try {
+      runIntegrityPollOnce(bridge)
+    } finally {
+      console.warn = previousWarn
+    }
+    assertEqual("空焦点轮询保持 bridge 安全状态", bridge.current(), null)
+    assertEqual("空焦点轮询不告警", pollWarnings.length, 0)
+    textarea.focus()
+    textarea.insertText("x")
+    await testSetup.renderOnce()
+    assertEqual("临时空焦点后 hook 仍存活", inputCalls.count, priorContentCalls + 2)
+  } finally {
+    bridge?.dispose()
+    assertEqual("dispose 恢复宿主 content 槽", textarea.onContentChange, initialContentListener)
+    assertEqual("dispose 恢复宿主 cursor 槽", textarea.onCursorChange, initialCursorListener)
+    await testSetup.dispose()
+  }
+}
+
+/** Bun 专属插件总链路：固定历史源，不读用户私有历史；Node 仍跑上面的真实 SDK 测试。 */
+async function runPluginSlotPipelineScenario(): Promise<void> {
+  if (typeof Bun === "undefined") return
+  const bunMock = (await import("bun:test")).mock
+  const mockCalls = { count: 0 }
+  bunMock.module(import.meta.resolve("../src/history-source"), () => ({
+    createHistorySource: () => {
+      mockCalls.count += 1
+      return {
+        entries: () => [makeHistoryEntry("hello from entry pipeline")],
+        refresh: () => {},
+      }
+    },
+  }))
+  const { default: plugin } = await import("../src/tui")
+  const testSetup = await createTestRenderer({ width: 110, height: 10 })
+  const { renderer } = testSetup
+  const textarea = new TextareaRenderable(renderer, {
+    id: "plugin-composer",
+    width: 100,
+    height: 2,
+    onContentChange: () => {},
+    onCursorChange: () => {},
+  })
+  const claims: Array<{ render: (properties: { sessionID: string }) => unknown }> = []
+  let disposePlugin: (() => void) | undefined
+  try {
+    renderer.root.add(textarea)
+    textarea.focus()
+    const context = {
+      renderer,
+      ui: { slot: (claim: { render: (properties: { sessionID: string }) => unknown }) => {
+        claims.push(claim)
+        return { dispose: () => {} }
+      } },
+      keymap: { layer: () => {}, mode: { current: () => "normal" } },
+    }
+    disposePlugin = plugin.setup(context) as () => void
+    assertEqual("插件使用隔离的固定历史源", mockCalls.count, 1)
+    await render(() => claims.map((claim) => claim.render({ sessionID: "isolated-session" })), renderer)
+    textarea.insertText("hel")
+    await testSetup.renderOnce()
+    assertTruthy("真实 renderer + slot 显示固定历史 ghost", testSetup.captureCharFrame().includes("hello from entry pipeline"))
+  } finally {
+    disposePlugin?.()
+    await testSetup.dispose()
+  }
+}
+
 async function main(): Promise<void> {
   console.log("[1] suggestion-store：dismiss 单输入压制 + 改一字符恢复")
   runDismissRearmScenario()
@@ -256,6 +377,15 @@ async function main(): Promise<void> {
   runSlotOverwriteSelfHealScenario()
   console.log("[5] editor-bridge：Symbol 守卫防 wrapper 嵌套放大（宿主迁移场景）")
   runWrapperMigrationGuardScenario()
+  if (typeof Bun !== "undefined") {
+    console.log("[6] 真实 renderer/textarea：getter、宿主监听及空槽首装、空焦点轮询")
+    await runRealRendererHookScenario(true)
+    await runRealRendererHookScenario(false)
+    console.log("[7] Bun 真实 renderer + Solid slot 插件总链路（固定历史）")
+    await runPluginSlotPipelineScenario()
+  } else {
+    console.log("SKIP  真实 OpenTUI renderer/textarea/slot：Node 无 OpenTUI native FFI；Bun 执行此回归")
+  }
   console.log("----")
   if (failedAssertionCount === 0) {
     console.log("测试结论：全部 PASS")

@@ -98,7 +98,14 @@
 - [x] 本地安装切换：file:// 条目移除（备份 opencode.json.bak.20261016_085430）→ `opencode plugin add github:dubuqiangu/opencode-history-ghost` 成功
 - [x] 发布链修复两处：① verify-install github 模式动态解析分支（原硬编码 origin/main）② index.ts 空占位导致服务端记录插件损坏（plugin list 显示 "- -"）→ 改为 default 导出 {id, setup}（姊妹插件实证模式）
 - [x] verify-install -Mode github 端到端：7 项全 PASS（HEAD=635897e 已推送、list commit 一致、stamp v0.1.0、src/scripts 树镜像、tui export、注册）VERIFY OK exit 0
-- 注意：运行中服务端仍持有旧快照（2026-10-14 启动），update 时 "Failed to check Server plugin" 告警在完整重启后消失
+- 历史记录（v0.1.0 安装时）：2026-10-14 启动的服务端持有旧配置快照，`plugin update` 曾输出 "Failed to check Server plugin"；这不代表 v0.1.1 的运行状态，是否消失及插件是否加载均待父代理真机确认。
+
+## T18 editor-bridge 真实 SDK 契约修复【F，待真机验收】
+- [x] `currentFocusedEditor` 改直接读取 getter 并绑定 SDK 类型；双槽未安装/undefined 与已安装区分；空焦点轮询避开 null 完整性校验。
+- [x] Bun 真实 renderer/textarea + 固定历史源 Solid slot 总链路回归；双槽初始 undefined、宿主已有 listener、空焦点轮询、假 renderer 同实例覆写及迁移守卫。
+- [x] 自动 RED→GREEN：新增真实 SDK getter/textarea/slot 回归先在旧桥接实现上复现 17 处失败（含 getter 调用异常与 ghost 未显示），再修复至 Bun 全 PASS；Node 逻辑模拟全 PASS，真实 renderer 因 Node 缺 OpenTUI native FFI 明确跳过。仅为自动验证，非宿主真机验收。
+- [x] 补丁版发布前准备：package.json 与 package-lock.json 根版本同步至 0.1.1；根 peerDependencies 不含 solid-js。未提交/推送/更新宿主安装。
+- [ ] 父代理负责最终真机验证及发布；合成构建/自动回归不代表真机加载成功。
 
 ## T12 收敛检查【O】
 - [x] 结构追溯：文件结构与 DESIGN §3 完全一致
@@ -107,4 +114,3 @@
 
 ## 发布门【O+用户】
 - [ ] 征询推送 GitHub；确认后先跑敏感信息扫描（真实凭据形状 + 本机路径/用户名 + 运行期产物）再 push
-

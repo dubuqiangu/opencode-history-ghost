@@ -1,6 +1,6 @@
 {
   "name": "opencode-history-ghost",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "History-based ghost-text autosuggest for the OpenCode V2 TUI prompt (gray suggestion line above the composer, Tab to accept)",
   "type": "module",
   "exports": {

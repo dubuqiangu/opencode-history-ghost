@@ -169,20 +169,21 @@ export function createEditorBridge(context: unknown): EditorBridge
 ```
 
 实现要点（半官方 API，全部防御式编码）：
-- `renderer = (context as any)?.renderer`，可选链每步判空；编辑器操作前判 `isDestroyed`。
+- `renderer.currentFocusedEditor` 是 **getter 属性，不是函数**（`@opentui/core/renderer.d.ts:418`）；直接读取，桥接类型绑定 SDK 的 `CliRenderer` 属性；空焦点返回 null，轮询不可把 null 传进双槽完整性校验。编辑器操作前判 `isDestroyed`。
 - `plainText` getter 读全文；`cursorOffset` 判光标在末尾；`replaceText(text)` 接受整句。
 - **双槽包装**：`onContentChange` 与 `onCursorChange` 两个监听槽都包一层
   （先调宿主原监听器再调我们的通知，各自 try/catch）；幂等（槽位现值已是我们的
-  wrapper 则不动）。**Symbol.for 守卫**：每个 wrapper 挂模块级
+  wrapper 则不动）；首次安装即使槽位和未安装记录均为 undefined，也必须分别安装两槽。**Symbol.for 守卫**：每个 wrapper 挂模块级
   `installedWrapperSymbol` 标记，重新安装时若槽位现值带标记则先解包取出真正的
   宿主监听器再链——任何路径下（含宿主把 wrapper 迁到新实例）最多一层包装。
 - **同实例槽位覆写自愈**：1.5s 轮询校验两个槽位现值仍是我们安装的 wrapper；
   被宿主覆写则**采纳宿主最新监听器为新的 original 重链**，陈旧的 original 丢弃、
   绝不恢复到宿主已弃用的赋值上。失效窗口 ≤ 1.5s。
-- **实例重建 + 可信采纳**：轮询对比 `currentFocusedEditor()` 身份：旧实例已销毁 →
+- **实例重建 + 可信采纳**：轮询对比 `currentFocusedEditor` 身份：旧实例已销毁 →
   新聚焦者即重建的 composer，采纳；旧实例仍存活而焦点移到别的编辑器 →
   对话框/侧栏输入，**拒绝包装**，触发 onForeignEditorFocus 让消费者清掉已显示建议。
 - 所有异常吞掉并 console.warn 一次（warn-once），绝不让插件崩宿主。
+- **SDK 回归**：Bun 使用真实 `createTestRenderer`、`TextareaRenderable`、Solid slot + 固定历史源验证 getter、有/无宿主 listener、空焦点轮询及 ghost 显示；Node 的 OpenTUI native FFI 不可用时仅运行假 renderer 逻辑用例。
 
 ### 3.4 suggestion-store.ts（写权限：lane B）
 

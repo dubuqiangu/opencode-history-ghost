@@ -1,6 +1,6 @@
 // Editor access bridge for opencode-history-ghost (T5, DESIGN §3.3; defect-3/4 fix).
 //
-// Every editor access goes through renderer.currentFocusedEditor() — a
+// Every editor access goes through renderer.currentFocusedEditor — a
 // semi-official surface (see @opentui/core renderer.d.ts:418 and
 // EditBufferRenderable.d.ts for plainText/cursorOffset/replaceText). The
 // whole module is defensive by contract: optional chaining at every step,
@@ -141,8 +141,8 @@ function warnOnce(message: string, error: unknown): void {
 /** Reads the focused editor; never throws, returns null when unusable. */
 function focusedEditor(context: unknown): EditBufferLike | null {
   try {
-    const renderer = (context as { renderer?: { currentFocusedEditor?: () => unknown } } | undefined)?.renderer
-    const editor = renderer?.currentFocusedEditor?.() as EditBufferLike | null | undefined
+    const renderer = (context as { renderer?: Pick<import("@opentui/core").CliRenderer, "currentFocusedEditor"> } | undefined)?.renderer
+    const editor = renderer?.currentFocusedEditor as EditBufferLike | null | undefined
     if (!editor || (editor as { isDestroyed?: boolean }).isDestroyed === true) return null
     return editor
   } catch (error) {
@@ -207,6 +207,8 @@ export function createEditorBridge(context: unknown): EditorBridge {
    */
   function editorHooksStillInstalled(editor: EditBufferLike): boolean {
     return (
+      installedContentChangeWrapper !== undefined &&
+      installedCursorChangeWrapper !== undefined &&
       editor.onContentChange === installedContentChangeWrapper &&
       editor.onCursorChange === installedCursorChangeWrapper
     )
@@ -226,14 +228,9 @@ export function createEditorBridge(context: unknown): EditorBridge {
     if (wrappedEditor === editor && editorHooksStillInstalled(editor)) return
     if (wrappedEditor !== editor) {
       detachEditorHooks()
-    } else {
-      // Same instance, overwritten slot(s): the stale saved original belongs
-      // to a host assignment we no longer own — drop it, never restore it.
-      originalOnContentChange = undefined
-      originalOnCursorChange = undefined
     }
     const capturedEditor = editor
-    if (editor.onContentChange !== installedContentChangeWrapper) {
+    if (installedContentChangeWrapper === undefined || editor.onContentChange !== installedContentChangeWrapper) {
       // Self-reference guard: if the slot still holds one of OUR wrappers
       // (migrated by the host, or left by an earlier install cycle), unwrap
       // it and chain onto the true host listener — never wrapper-on-wrapper.
@@ -259,7 +256,7 @@ export function createEditorBridge(context: unknown): EditorBridge {
         originalOnContentChange = undefined
       }
     }
-    if (editor.onCursorChange !== installedCursorChangeWrapper) {
+    if (installedCursorChangeWrapper === undefined || editor.onCursorChange !== installedCursorChangeWrapper) {
       // Self-reference guard: same unwrap-before-chain rule as the content
       // slot above.
       originalOnCursorChange = unwrapInstalledWrapper(editor.onCursorChange)
@@ -295,14 +292,14 @@ export function createEditorBridge(context: unknown): EditorBridge {
     try {
       // Only restore a slot we still own; if the host overwrote it, its
       // newer listener stays in place untouched.
-      if (editor.onContentChange === installedContentChangeWrapper) {
+      if (installedContentChangeWrapper !== undefined && editor.onContentChange === installedContentChangeWrapper) {
         editor.onContentChange = originalOnContentChange
       }
     } catch (error) {
       warnOnce("failed to restore the original onContentChange listener:", error)
     }
     try {
-      if (editor.onCursorChange === installedCursorChangeWrapper) {
+      if (installedCursorChangeWrapper !== undefined && editor.onCursorChange === installedCursorChangeWrapper) {
         editor.onCursorChange = originalOnCursorChange
       }
     } catch (error) {
@@ -350,7 +347,7 @@ export function createEditorBridge(context: unknown): EditorBridge {
   function runIdentityPoll(): void {
     try {
       const editor = focusedEditor(context)
-      if (editor === wrappedEditor) {
+      if (editor && editor === wrappedEditor) {
         // Same instance — also detect the host having re-assigned either
         // listener slot on it; re-chain onto the newest listeners then.
         if (editorHooksStillInstalled(editor)) return
