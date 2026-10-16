@@ -1,0 +1,18 @@
+{
+  "name": "opencode-history-ghost",
+  "version": "0.1.0",
+  "description": "History-based ghost-text autosuggest for the OpenCode V2 TUI prompt (gray suggestion line above the composer, Tab to accept)",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest",
+    "fuzzysort": "^4.0.2"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8"
+  }
+}
