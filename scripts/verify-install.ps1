@@ -180,8 +180,11 @@ if ($Mode -eq "file") {
   # --- github 模式: 发布链端到端验证 ---------------------------------------------------
 
   $localHead = Read-GitShortRef $repoRoot "HEAD"
-  $originHead = Read-GitShortRef $repoRoot "origin/main"
-  Assert-Check "local HEAD is pushed (HEAD == origin/main)" ($localHead -ne "" -and $localHead -eq $originHead) "HEAD=$localHead origin=$originHead"
+  # 动态解析当前分支（仓库可能用 master/main 等任意默认分支名，不硬编码）
+  $currentBranch = ""
+  try { $currentBranch = @(git -C $repoRoot symbolic-ref --short HEAD 2>$null)[0] } catch { $currentBranch = "" }
+  $originHead = if ($currentBranch) { Read-GitShortRef $repoRoot "origin/$currentBranch" } else { "" }
+  Assert-Check "local HEAD is pushed (HEAD == origin/$currentBranch)" ($localHead -ne "" -and $currentBranch -ne "" -and $localHead -eq $originHead) "HEAD=$localHead branch=$currentBranch origin=$originHead"
 
   $expectedSrcCount = Count-TrackedFiles $repoRoot "src"
   $expectedScriptsCount = Count-TrackedFiles $repoRoot "scripts"
