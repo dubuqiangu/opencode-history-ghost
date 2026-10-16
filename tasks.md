@@ -91,6 +91,15 @@
 - 验证：verify-install 修补后全 PASS exit 0 + V1 人为复现 FAIL 路径 exit 1 + 双运行时 5 用例 PASS + esbuild 复跑零报错 + DESIGN 抽查对照行号
 - P1/P2（发布后）：matcher 对抗五件套、history-source 归一化专项、keymap run 守卫 mock、ghost-line computeSegments 导出
 
+## T17 上库与一键安装【O，2026-10-16 完成】
+- [x] README 占位符填实（dubuqiangu）；本机绝对路径 3 处脱敏（README 安装示例 + tasks.md 2 处）
+- [x] 脱敏扫描（独立步骤、读完输出才 push）：凭据零命中、运行期产物零命中、绝对路径脱敏后复扫干净
+- [x] git init + commit + 推送 + tag v0.1.0：https://github.com/dubuqiangu/opencode-history-ghost（master）
+- [x] 本地安装切换：file:// 条目移除（备份 opencode.json.bak.20261016_085430）→ `opencode plugin add github:dubuqiangu/opencode-history-ghost` 成功
+- [x] 发布链修复两处：① verify-install github 模式动态解析分支（原硬编码 origin/main）② index.ts 空占位导致服务端记录插件损坏（plugin list 显示 "- -"）→ 改为 default 导出 {id, setup}（姊妹插件实证模式）
+- [x] verify-install -Mode github 端到端：7 项全 PASS（HEAD=635897e 已推送、list commit 一致、stamp v0.1.0、src/scripts 树镜像、tui export、注册）VERIFY OK exit 0
+- 注意：运行中服务端仍持有旧快照（2026-10-14 启动），update 时 "Failed to check Server plugin" 告警在完整重启后消失
+
 ## T12 收敛检查【O】
 - [x] 结构追溯：文件结构与 DESIGN §3 完全一致
 - [x] 代码级追溯：oracle 增量复审逐项验收通过（见 T13）
