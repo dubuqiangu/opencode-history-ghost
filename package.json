@@ -3,16 +3,16 @@
   "version": "0.1.1",
   "description": "History-based ghost-text autosuggest for the OpenCode V2 TUI prompt (gray suggestion line above the composer, Tab to accept)",
   "type": "module",
+  "scripts": {
+    "build:tui": "npx esbuild@0.28.2 src/tui.tsx --bundle --format=esm --platform=node --target=es2022 --jsx=automatic --external:@opencode/* --external:@opentui/* --external:solid-js --external:solid-js/* --outfile=dist/tui.js && node scripts/stamp-build.mjs",
+    "check:delivery": "bun test test/tui-delivery.test.ts"
+  },
   "exports": {
     ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./dist/tui.js"
   },
   "dependencies": {
     "@opencode/plugin": "latest",
     "fuzzysort": "^4.0.2"
-  },
-  "peerDependencies": {
-    "@opentui/core": ">=0.5.8",
-    "@opentui/solid": ">=0.5.8"
   }
 }

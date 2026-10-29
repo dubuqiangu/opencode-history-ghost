@@ -5,7 +5,7 @@
 // opencode-autocontinue plugin, which registers its layer from the first
 // `app` slot render for exactly this reason).
 //
-// The layer is globally scoped but enabled only while all three hold:
+// The suggestion shortcut layer is globally scoped but enabled only while all three hold:
 //   - the master switch is on,
 //   - a suggestion is currently visible,
 //   - the host's own completion popup is inactive (its input mode is
@@ -17,16 +17,16 @@
 // its type — the host removes the layer when the creating reactive scope
 // disposes — but a disposable return value is still captured defensively,
 // mirroring the working autocontinue pattern.
+// The palette toggle lives in a separate global, unbound layer so it remains
+// discoverable without a suggestion or composer focus.
 //
-// RUN-TIME CONSISTENCY GUARD (defect-2 fix): a visible suggestion was
-// produced from the composer's text, so every store-mutating command first
-// re-verifies that the focused editor still holds exactly that (trimmed)
-// input. A dialog input focused within the editor bridge's <= 1.5s poll
-// race window — or any other focus anomaly — yields the key back to the
-// host instead of firing on the wrong editor.
+// RUN-TIME CONSISTENCY GUARD: bridge.current() synchronously limits focus
+// to the trusted composer; full text, native prefix and offset must also
+// match the snapshot captured when the candidate was shown.
 
-import type { EditorBridge } from "./editor-bridge"
+import type { EditorBridge, EditorSnapshot } from "./editor-bridge"
 import type { HistoryGhostSettings, SuggestionStoreApi } from "./suggestion-store"
+import { recordFailure } from "./probe-log"
 
 export interface KeymapDeps {
   readonly bridge: EditorBridge
@@ -48,34 +48,78 @@ const LOG_PREFIX = "[opencode-history-ghost]"
 function safeInputMode(keymap: KeymapLike): string {
   try {
     return keymap.mode?.current() ?? ""
-  } catch {
+  } catch (error) {
+    recordFailure("keymap.mode", error)
     return ""
   }
 }
 
-/**
- * True while the focused editor's text still equals the (trimmed) input the
- * visible suggestion was produced from — see the header's run-time
- * consistency guard.
- */
-function suggestionMatchesFocusedEditor(deps: KeymapDeps): boolean {
-  const suggestionState = deps.store.state()
-  if (!suggestionState) return false
-  const focusedEditorText = deps.bridge.inputText()
-  if (focusedEditorText === null) return false
-  return focusedEditorText.trim() === suggestionState.input
+/** Host-owned completion and modal scopes must retain their keyboard input. */
+function isHostOverlayMode(keymap: KeymapLike): boolean {
+  const inputMode = safeInputMode(keymap)
+  return inputMode === "autocomplete" || inputMode === "modal"
 }
 
 /**
- * Registers the history-ghost keymap layer. Returns a cleanup function that
- * unregisters it best-effort (a no-op when the host owns layer lifetime).
+ * Validates that the editor state still matches the snapshot captured when the
+ * candidate was shown, and that the candidate is still keyed to the live caret
+ * prefix. The snapshot is refreshed on every store state change, and the fast
+ * path commits too, so it never lags a real keystroke; the text/offset equality
+ * here is what stops a silent foreign edit (e.g. a listener slot the host
+ * overwrote) from accepting a suggestion that no longer fits the buffer.
  */
-export function registerKeymap(context: unknown, deps: KeymapDeps): () => void {
+function suggestionMatchesFocusedEditor(deps: KeymapDeps, candidateSnapshot: EditorSnapshot | null): boolean {
+  // The layer's `enabled` no longer reads plugin settings (store state is not a
+  // reactive signal there), so the master switch must be honoured here.
+  if (!deps.settings.enabled) return false
+  const suggestionState = deps.store.state()
+  if (!suggestionState) return false
+  const current = deps.bridge.caretSnapshot()
+  if (!current || !candidateSnapshot) return false
+  if (current.editor !== candidateSnapshot.editor) return false
+  if (current.text !== candidateSnapshot.text || current.prefix !== candidateSnapshot.prefix || current.offset !== candidateSnapshot.offset) return false
+  return current.prefix.trim() === suggestionState.input
+}
+
+/** True when the caret sits at the very end of the composer text. */
+function caretAtTextEnd(snapshot: EditorSnapshot): boolean {
+  return snapshot.prefix === snapshot.text
+}
+
+/**
+ * Registers the suggestion shortcuts and palette toggle in separate layers.
+ * Returns a cleanup function that unregisters both best-effort (a no-op when
+ * the host owns layer lifetime).
+ *
+ * The cleanup carries a `suggestionLayerRegistered` flag: a sync throw from
+ * `keymap.layer` leaves the shortcuts unbound, and the caller must be able to
+ * see that and retry on a later slot render instead of assuming success.
+ */
+export interface KeymapRegistration {
+  (): void
+  /** True when the suggestion-shortcut layer was accepted by the host. */
+  readonly suggestionLayerRegistered: boolean
+}
+
+export function registerKeymap(context: unknown, deps: KeymapDeps): KeymapRegistration {
   const keymap = (context as { keymap?: KeymapLike } | undefined)?.keymap
   if (!keymap || typeof keymap.layer !== "function") {
     console.warn(`${LOG_PREFIX} keymap API unavailable; history-ghost shortcuts are disabled`)
-    return () => {}
+    const unavailableCleanup = (): void => {}
+    Object.defineProperty(unavailableCleanup, "suggestionLayerRegistered", {
+      value: false,
+      enumerable: true,
+    })
+    return unavailableCleanup as KeymapRegistration
   }
+
+  // The candidate is keyed to the editor state at the moment it was shown.
+  // Refresh that snapshot on every store change so dispatch can verify the
+  // buffer did not silently drift under the suggestion.
+  let candidateSnapshot = deps.store.hasSuggestion() ? deps.bridge.caretSnapshot() : null
+  const stopSnapshotListening = deps.store.onStateChange(() => {
+    candidateSnapshot = deps.store.hasSuggestion() ? deps.bridge.caretSnapshot() : null
+  })
 
   const requestRender = (): void => {
     try {
@@ -85,16 +129,19 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void {
     }
   }
 
-  let layerDispose: (() => void) | undefined
+  const layerDisposers: Array<() => void> = []
+  let suggestionLayerRegistered = false
   try {
     const layerResult = keymap.layer(() => ({
       mode: "global",
       // Only dispatch while the composer textarea itself has focus.
       target: () => deps.bridge.current(),
-      enabled: () =>
-        deps.settings.enabled === true &&
-        deps.store.hasSuggestion() &&
-        safeInputMode(keymap) !== "autocomplete",
+      // Deliberately independent of store state: the host evaluates `enabled`
+      // reactively, and the store's state is plain mutable data (not a signal),
+      // so a `hasSuggestion()` read here froze the layer at its first value —
+      // false — and the shortcuts never dispatched again. Suggestibility is
+      // re-checked inside each run(), where it costs nothing and is always live.
+      enabled: () => !isHostOverlayMode(keymap),
       commands: [
         {
           id: "history-ghost.accept",
@@ -105,13 +152,30 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void {
             if (!candidate) return false
             // Focus race guard (see header): a dialog input focused within
             // the bridge's poll window must never be rewritten by Tab.
-            if (!suggestionMatchesFocusedEditor(deps)) return false
-            // Only ever accept while the caret sits at the end of the input
-            // (fish/pi convention, DESIGN §4) — a caret moved into the middle
-            // must not have Tab steal the whole buffer.
-            if (!deps.bridge.cursorAtEnd()) return false
+            if (isHostOverlayMode(keymap) || !suggestionMatchesFocusedEditor(deps, candidateSnapshot)) return false
+            // 中段光标也接受：用户确认的契约是 abc|XYZ 按 Tab 后整段变候选文本
+            // （TEST caret-prefix-accept 固定该行为）。
             // Consumed on success (no return value); yielded back to the host
             // only when the editor write failed so Tab still does something.
+            if (!deps.bridge.acceptFullText(candidate.text)) return false
+            deps.store.clear()
+            requestRender()
+          },
+        },
+        {
+          // "right" is a second accept key, not a replacement for acceptKey.
+          // It only fires with the caret past the last typed character, so
+          // ordinary caret movement keeps working untouched.
+          id: "history-ghost.accept-forward",
+          title: "History Ghost: 接受建议（右箭头）",
+          bind: "right",
+          run: () => {
+            if (isHostOverlayMode(keymap)) return false
+            if (!suggestionMatchesFocusedEditor(deps, candidateSnapshot)) return false
+            const liveSnapshot = deps.bridge.caretSnapshot()
+            if (!liveSnapshot || !caretAtTextEnd(liveSnapshot)) return false
+            const candidate = deps.store.current()
+            if (!candidate) return false
             if (!deps.bridge.acceptFullText(candidate.text)) return false
             deps.store.clear()
             requestRender()
@@ -122,7 +186,7 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void {
           title: "History Ghost: 下一条建议",
           bind: "ctrl+down",
           run: () => {
-            if (!suggestionMatchesFocusedEditor(deps)) return false
+            if (isHostOverlayMode(keymap) || !suggestionMatchesFocusedEditor(deps, candidateSnapshot)) return false
             deps.store.cycle(1)
             requestRender()
           },
@@ -132,7 +196,7 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void {
           title: "History Ghost: 上一条建议",
           bind: "ctrl+up",
           run: () => {
-            if (!suggestionMatchesFocusedEditor(deps)) return false
+            if (isHostOverlayMode(keymap) || !suggestionMatchesFocusedEditor(deps, candidateSnapshot)) return false
             deps.store.cycle(-1)
             requestRender()
           },
@@ -144,36 +208,61 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void {
           run: () => {
             // Focus race guard: a dialog's first Esc must close the dialog,
             // not dismiss a composer suggestion.
-            if (!suggestionMatchesFocusedEditor(deps)) return false
+            if (isHostOverlayMode(keymap) || !suggestionMatchesFocusedEditor(deps, candidateSnapshot)) return false
             deps.store.dismiss()
             requestRender()
-          },
-        },
-        {
-          id: "history-ghost.toggle",
-          title: "History Ghost: 开关历史建议",
-          palette: true,
-          run: () => {
-            deps.onToggle()
           },
         },
       ],
     }))
     if (typeof (layerResult as { dispose?: unknown })?.dispose === "function") {
-      layerDispose = (layerResult as { dispose: () => void }).dispose
+      layerDisposers.push((layerResult as { dispose: () => void }).dispose)
     } else if (typeof layerResult === "function") {
-      layerDispose = layerResult as () => void
+      layerDisposers.push(layerResult as () => void)
     }
+    suggestionLayerRegistered = true
   } catch (error) {
-    layerDispose = undefined
-    console.warn(`${LOG_PREFIX} keymap layer registration failed:`, error)
+    recordFailure("keymap.suggestion", error)
+    console.warn(`${LOG_PREFIX} suggestion keymap layer registration failed:`, error)
   }
 
-  return () => {
-    try {
-      layerDispose?.()
-    } catch (error) {
-      console.warn(`${LOG_PREFIX} keymap layer unregistration failed:`, error)
+  // Layer.enabled gates palette discovery too; keep this unbound command
+  // outside the suggestion-only layer so it is reachable with empty history,
+  // a disabled master switch, or focus outside the composer.
+  try {
+    const toggleLayerResult = keymap.layer(() => ({
+      mode: "global",
+      commands: [{
+        id: "history-ghost.toggle",
+        title: "History Ghost: 开关历史建议",
+        palette: true,
+        run: () => { deps.onToggle() },
+      }],
+    }))
+    if (typeof (toggleLayerResult as { dispose?: unknown })?.dispose === "function") {
+      layerDisposers.push((toggleLayerResult as { dispose: () => void }).dispose)
+    } else if (typeof toggleLayerResult === "function") {
+      layerDisposers.push(toggleLayerResult as () => void)
+    }
+  } catch (error) {
+    recordFailure("keymap.toggle", error)
+    console.warn(`${LOG_PREFIX} palette keymap layer registration failed:`, error)
+  }
+
+  const cleanup = (): void => {
+    stopSnapshotListening()
+    for (const disposeLayer of layerDisposers.reverse()) {
+      try {
+        disposeLayer()
+      } catch (error) {
+        recordFailure("keymap.dispose", error)
+        console.warn(`${LOG_PREFIX} keymap layer unregistration failed:`, error)
+      }
     }
   }
+  Object.defineProperty(cleanup, "suggestionLayerRegistered", {
+    value: suggestionLayerRegistered,
+    enumerable: true,
+  })
+  return cleanup as KeymapRegistration
 }

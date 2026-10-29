@@ -28,7 +28,8 @@ import { createHistorySource, type HistoryEntry } from "../src/history-source"
 import { createSuggestionStore, type HistoryGhostSettings } from "../src/suggestion-store"
 import { createEditorBridge, runIntegrityPollOnce } from "../src/editor-bridge"
 import { createTestRenderer } from "@opentui/core/testing"
-import { TextareaRenderable } from "@opentui/core"
+import { BoxRenderable, TextareaRenderable } from "@opentui/core"
+import { createComposerIdentity } from "../src/composer-identity"
 import { render } from "@opentui/solid"
 
 let failedAssertionCount = 0
@@ -53,7 +54,7 @@ function makeTestSettings(): HistoryGhostSettings {
     enabled: true,
     acceptKey: "tab",
     minChars: 3,
-    maxCandidates: 5,
+    maxCandidates: 10,
     maxEntries: 2000,
     maxTextLength: 2000,
     excludePrefixes: ["/", "@"],
@@ -103,6 +104,16 @@ function makeHostContext(holder: FocusedEditorHolder): unknown {
       get currentFocusedEditor() { return holder.editor },
     },
   }
+}
+
+function mountPrompt(renderer: Awaited<ReturnType<typeof createTestRenderer>>["renderer"], textarea: TextareaRenderable, identity: ReturnType<typeof createComposerIdentity>): void {
+  const root = new BoxRenderable(renderer, { id: `root-${textarea.id}` })
+  const border = new BoxRenderable(renderer, { id: `border-${textarea.id}` })
+  const padding = new BoxRenderable(renderer, { id: `padding-${textarea.id}` })
+  const footer = new BoxRenderable(renderer, { id: `footer-${textarea.id}` })
+  const marker = new BoxRenderable(renderer, { id: `marker-${textarea.id}`, width: 0, height: 0 })
+  root.add(border); border.add(padding); padding.add(textarea); padding.add(new BoxRenderable(renderer, { id: `metadata-${textarea.id}` })); root.add(footer); footer.add(marker)
+  renderer.root.add(root); identity.register("isolated-session", marker)
 }
 
 const EDITOR_TEST_EVENT = { testEventMarker: "history-ghost-unit-test" }
@@ -193,11 +204,13 @@ function runSlotOverwriteSelfHealScenario(): void {
   const holder: FocusedEditorHolder = {
     editor: makeFakeEditBuffer("hello", hostOriginalContentListener, () => {}),
   }
-  const bridge = createEditorBridge(makeHostContext(holder))
+  const bridge = createEditorBridge(makeHostContext(holder), { resolve: () => holder.editor?.isDestroyed ? null : holder.editor })
   const inputNotifications = { count: 0 }
   bridge.onInput(() => {
     inputNotifications.count += 1
   })
+  runIntegrityPollOnce(bridge)
+  inputNotifications.count = 0
   // 宿主在同一实例上覆写两个监听槽位（悄悄丢掉我们的 wrapper）
   const newHostContentListenerCalls = { count: 0 }
   holder.editor!.onContentChange = () => {
@@ -206,6 +219,7 @@ function runSlotOverwriteSelfHealScenario(): void {
   holder.editor!.onCursorChange = () => {}
   // 手动触发一轮身份轮询（与 watch() 的 1.5s 定时器运行同一函数体）
   runIntegrityPollOnce(bridge)
+  inputNotifications.count = 0
   holder.editor!.onContentChange!(EDITOR_TEST_EVENT)
   assertEqual("宿主新监听器恰好收到一次事件", newHostContentListenerCalls.count, 1)
   assertEqual("我方 handler 恰好收到一次通知", inputNotifications.count, 1)
@@ -226,11 +240,13 @@ function runWrapperMigrationGuardScenario(): void {
   const holder: FocusedEditorHolder = {
     editor: makeFakeEditBuffer("first", hostOriginalContentListener, () => {}),
   }
-  const bridge = createEditorBridge(makeHostContext(holder))
+  const bridge = createEditorBridge(makeHostContext(holder), { resolve: () => holder.editor?.isDestroyed ? null : holder.editor })
   const inputNotifications = { count: 0 }
   bridge.onInput(() => {
     inputNotifications.count += 1
   })
+  runIntegrityPollOnce(bridge)
+  inputNotifications.count = 0
   // 宿主把我们的 wrapper 原样迁移到新编辑器（不清理槽位），随后销毁旧实例
   const migratedEditor = makeFakeEditBuffer("migrated", undefined, undefined)
   migratedEditor.onContentChange = holder.editor!.onContentChange
@@ -238,6 +254,7 @@ function runWrapperMigrationGuardScenario(): void {
   holder.editor!.isDestroyed = true
   holder.editor = migratedEditor
   runIntegrityPollOnce(bridge)
+  inputNotifications.count = 0
   migratedEditor.onContentChange!(EDITOR_TEST_EVENT)
   assertEqual(
     "宿主真正的监听器恰好执行一次（无 wrapper 嵌套放大、无丢失）",
@@ -271,12 +288,15 @@ async function runRealRendererHookScenario(withHostListeners: boolean): Promise<
   }
   let bridge: ReturnType<typeof createEditorBridge> | undefined
   try {
-    renderer.root.add(textarea)
+    const context = { renderer, ui: { router: { current: () => ({ type: "session", sessionID: "isolated-session" }) } } }
+    const identity = createComposerIdentity(context)
+    mountPrompt(renderer, textarea, identity)
     textarea.focus()
-    bridge = createEditorBridge({ renderer })
+    bridge = createEditorBridge(context, identity)
     assertTruthy("真实 renderer getter 指向 textarea", bridge.current() === textarea)
     bridge.onInput(() => { inputCalls.count += 1 })
     bridge.onCaretMove(() => { caretCalls.count += 1 })
+    runIntegrityPollOnce(bridge)
     assertTruthy("真实 textarea 首次安装 content wrapper", typeof textarea.onContentChange === "function")
     assertTruthy("真实 textarea 首次安装 cursor wrapper", typeof textarea.onCursorChange === "function")
     textarea.insertText("hel")
@@ -341,14 +361,12 @@ async function runPluginSlotPipelineScenario(): Promise<void> {
     onContentChange: () => {},
     onCursorChange: () => {},
   })
-  const claims: Array<{ render: (properties: { sessionID: string }) => unknown }> = []
+  const claims: Array<{ append: string; render: (properties: { sessionID: string }) => unknown }> = []
   let disposePlugin: (() => void) | undefined
   try {
-    renderer.root.add(textarea)
-    textarea.focus()
     const context = {
       renderer,
-      ui: { slot: (claim: { render: (properties: { sessionID: string }) => unknown }) => {
+      ui: { router: { current: () => ({ type: "session", sessionID: "isolated-session" }) }, slot: (claim: { append: string; render: (properties: { sessionID: string }) => unknown }) => {
         claims.push(claim)
         return { dispose: () => {} }
       } },
@@ -356,7 +374,17 @@ async function runPluginSlotPipelineScenario(): Promise<void> {
     }
     disposePlugin = plugin.setup(context) as () => void
     assertEqual("插件使用隔离的固定历史源", mockCalls.count, 1)
+    const fixtureIdentity = createComposerIdentity(context)
+    mountPrompt(renderer, textarea, fixtureIdentity)
+    const promptRoot = textarea.parent?.parent?.parent
+    const footer = promptRoot?.getChildren().find((child) => child !== textarea.parent?.parent)
     await render(() => claims.map((claim) => claim.render({ sessionID: "isolated-session" })), renderer)
+    const marker = renderer.root.getChildren().find((child) => child instanceof BoxRenderable && child !== promptRoot && child.getChildrenCount() === 0 && child.width === 0)
+    if (marker && footer) { renderer.root.remove(marker); footer.add(marker) }
+    textarea.focus()
+    // Poll after the asynchronous slot ref is connected to the renderer tree.
+    // Plugin bridge is private; the interval performs its normal reconciliation.
+    await new Promise((resolve) => setTimeout(resolve, 1600))
     textarea.insertText("hel")
     await testSetup.renderOnce()
     assertTruthy("真实 renderer + slot 显示固定历史 ghost", testSetup.captureCharFrame().includes("hello from entry pipeline"))

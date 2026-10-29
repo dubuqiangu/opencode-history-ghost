@@ -22,12 +22,17 @@
 // primitive is imported anywhere in this plugin — see ghost-line.tsx for the
 // module-graph evidence.
 
+import * as fs from "node:fs"
 import { Plugin } from "@opencode/plugin/tui"
 import { createHistorySource } from "./history-source"
 import { createEditorBridge } from "./editor-bridge"
+import { createComposerIdentity } from "./composer-identity"
 import { createSuggestionStore, type HistoryGhostSettings } from "./suggestion-store"
 import { createGhostLine } from "./ghost-line"
 import { registerKeymap } from "./keymap"
+
+import { probeContextShape } from "./context-probe"
+import { recordEvent, recordFailure } from "./probe-log"
 
 /** History-source refresh cadence (jsonl mtime poll, DESIGN §2). */
 const HISTORY_REFRESH_INTERVAL_MS = 3000
@@ -38,7 +43,7 @@ function defaultSettings(): HistoryGhostSettings {
     enabled: true,
     acceptKey: "tab",
     minChars: 3,
-    maxCandidates: 5,
+    maxCandidates: 10,
     maxEntries: 2000,
     maxTextLength: 2000,
     excludePrefixes: ["/", "@"],
@@ -48,6 +53,32 @@ function defaultSettings(): HistoryGhostSettings {
 export default Plugin.define({
   id: "history-ghost",
   setup(context: any) {
+    // The host runs this plugin definition once per process role:
+    //   - role=server  (the serve/daemon process): NO `ui` surface at all.
+    //   - role=cli     (the TUI client process):     `ui.slot`, `ui.dialog`,
+    //                                                 `ui.toast`, `renderer`,
+    //                                                 `theme`, and top-level
+    //                                                 `keymap.layer`.
+    // Registering UI from the server process is meaningless: every
+    // `context.ui?.slot?.(...)` there evaluates to `undefined`, silently
+    // skipping all slots and leaving the keymap layer unreachable (its render
+    // never runs). Bail out explicitly instead of relying on optional chaining.
+    if (typeof context?.ui?.slot !== "function") return
+
+    try {
+      // Temporary: records the real host context shape for diagnosis.
+      probeContextShape(context)
+    } catch {}
+    // Temporary: the host runs setup() once per process role. Only the TUI
+    // client gets a `ui` surface; the server-side run must not register UI.
+    try {
+      const runtimeRole = context?.ui?.slot ? "client" : "server"
+      fs.appendFileSync(
+        "D:\\workSpace\\python\\aicode\\opencode\\opencode-history-ghost\\probe-runtime-role.txt",
+        `${new Date().toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} role=${runtimeRole} bootstrap=${Object.prototype.hasOwnProperty.call(context, "bootstrap")} ui=${typeof context?.ui}\n`,
+      )
+    } catch {}
+
     // ---- Durable settings (DESIGN §3.8): survives restarts, hot reloads,
     // and live-syncs across running TUI instances. Storage-miss fallback
     // (defect-6 fix): a host without the storage API must not crash setup —
@@ -63,6 +94,7 @@ export default Plugin.define({
         updateSettings = settingsPair[1]
       }
     } catch (error) {
+      recordFailure("settings.store", error)
       console.warn("[opencode-history-ghost] settings storage unavailable; using in-memory defaults:", error)
     }
     const settings: HistoryGhostSettings = resolvedSettings ?? defaultSettings()
@@ -72,9 +104,20 @@ export default Plugin.define({
       maxEntries: settings.maxEntries,
       maxTextLength: settings.maxTextLength,
     })
-    const editorBridge = createEditorBridge(context)
+    const composerIdentity = createComposerIdentity(context)
+    const editorBridge = createEditorBridge(context, composerIdentity)
     const suggestionStore = createSuggestionStore(() => historySource.entries(), settings)
-    const ghostLine = createGhostLine({ store: suggestionStore, settings, theme: context.theme })
+    const ghostLine = createGhostLine({
+      store: suggestionStore,
+      settings,
+      theme: context.theme,
+      // The inline grey suffix overlays the proven composer textarea. The
+      // bridge's current() already limits focus to the trusted composer, so it
+      // is the single safe source for the overlay's geometry.
+      editorSource: { currentEditor: () => editorBridge.current() },
+    })
+    let observedHistoryEntries = historySource.entries()
+    let disposed = false
 
     const requestRender = (): void => {
       try {
@@ -86,42 +129,79 @@ export default Plugin.define({
 
     // ---- UI pipeline: every committed store change patches the ghost line
     // and asks the renderer for a repaint. This one listener covers every
-    // mutation path (typing, cycle, dismiss, accept, toggle).
+    // mutation path (typing, caret moves, cycle, dismiss, accept, toggle).
     const stopStateListening = suggestionStore.onStateChange(() => {
       ghostLine.refresh()
       requestRender()
     })
 
-    // ---- Input wiring: re-evaluate the suggestion on every keystroke.
-    // Ghost text only appears while the caret sits at the end of the input
-    // (fish/pi convention, DESIGN §4); anywhere else the line collapses.
-    const stopInputListening = editorBridge.onInput((text: string) => {
+    // ---- Input wiring: match only the prefix before the caret. The bridge
+    // obtains native display-cell ranges, not JS string offset slices.
+    const evaluateCaretPrefix = (): void => {
       try {
-        if (!editorBridge.cursorAtEnd()) {
-          suggestionStore.clear()
-        } else {
-          suggestionStore.evaluate(text)
-        }
+        const prefix = editorBridge.caretPrefix()
+        if (prefix === null) suggestionStore.clear()
+        else suggestionStore.evaluate(prefix)
       } catch (error) {
+        recordFailure("input.evaluate", error)
         console.warn("[opencode-history-ghost] input handling failed:", error)
       }
+    }
+    const reassessChangedHistory = (): void => {
+      if (disposed) return
+      const latestEntries = historySource.entries()
+      if (latestEntries === observedHistoryEntries) return
+      observedHistoryEntries = latestEntries
+      try {
+        const prefix = editorBridge.caretPrefix()
+        if (prefix === null) suggestionStore.clear()
+        else suggestionStore.reassess(prefix)
+      } catch (error) {
+        recordFailure("input.reassess", error)
+        console.warn("[opencode-history-ghost] history re-assessment failed:", error)
+      }
+    }
+    // DB loading resolves without an input event. A disposed instance must not
+    // touch the bridge/store when the asynchronous load finally settles.
+    void historySource.whenReady?.().then(reassessChangedHistory, (error) => {
+      if (!disposed) console.warn("[opencode-history-ghost] history readiness failed:", error)
     })
-    // Typing alone cannot see the caret LEAVING the end (pure cursor moves
-    // fire onCursorChange, not onContentChange) — collapse on those.
-    const stopCaretListening = editorBridge.onCaretMove((caretAtEnd: boolean) => {
-      if (!caretAtEnd) suggestionStore.clear()
+    const stopInputListening = editorBridge.onInput(evaluateCaretPrefix)
+    // Cursor-only movements can change the matching prefix without any edit.
+    // The overlay is repainted here as well: moving the caret between lines
+    // changes the suffix's screen cell while the store state stays identical,
+    // so waiting for a state change would leave the suffix on the old row.
+    const stopCaretListening = editorBridge.onCaretMove(() => {
+      evaluateCaretPrefix()
+      ghostLine.refresh()
     })
-    // Focus landing on a foreign editor surface (dialog input, sidebar
-    // search) while the known composer still lives: the bridge refuses to
-    // follow, so no NEW suggestion can appear from that typing — this only
-    // collapses whatever was already visible so the ghost line cannot
-    // linger above the composer during dialogs (defect-2 fix).
+    // Leaving the proven composer (including blur to no editor) collapses
+    // visible ghost text immediately. Bridge emits once per untrusted focus
+    // transition, so its poll does not repeatedly clear valid state.
     const stopForeignFocusListening = editorBridge.onForeignEditorFocus(() => {
       suggestionStore.clear()
     })
     // Keep the composer hooks mounted across host-side textarea rebuilds
     // and same-instance listener-slot overwrites.
     editorBridge.watch()
+
+    // The marker ref may run before its parent is attached. The bridge poll
+    // reconciles the proof after mounting; no setup-time focused-editor hook.
+    let stopIdentitySlot: (() => void) | undefined
+    try {
+      const identitySlotResult = context.ui?.slot?.({
+        append: "prompt.footer",
+        render: (properties: { sessionID?: string }) =>
+          <box width={0} height={0} focusable={false} ref={(marker) => {
+            if (marker && properties.sessionID) composerIdentity.register(properties.sessionID, marker)
+          }} />,
+      })
+      if (typeof identitySlotResult?.dispose === "function") stopIdentitySlot = identitySlotResult.dispose
+      else if (typeof identitySlotResult === "function") stopIdentitySlot = identitySlotResult
+    } catch (error) {
+      recordFailure("slot.prompt.footer", error)
+      console.warn("[opencode-history-ghost] footer identity slot unavailable:", error)
+    }
 
     // ---- Master-switch callback (palette command "History Ghost: 开关历史建议").
     const onToggle = (): void => {
@@ -169,20 +249,29 @@ export default Plugin.define({
       const appSlotResult = context.ui?.slot?.({
         append: "app",
         render: () => {
+          // Retry on success, not on "we tried once": a failed keymap layer
+          // registration must be retryable on the next app render instead of
+          // being locked out forever by the `keymapCleanup === undefined` guard.
+          recordEvent("app.render")
           if (keymapCleanup === undefined) {
-            keymapCleanup = registerKeymap(context, {
+            const registration = registerKeymap(context, {
               bridge: editorBridge,
               store: suggestionStore,
               settings,
               onToggle,
             })
+            if (registration.suggestionLayerRegistered) keymapCleanup = registration
           }
-          return null
+          // The inline grey suffix is a static absolutely-positioned node on
+          // the app slot; mounting it here keeps the whole suggestion surface
+          // on one slot and lets the bridge be the single trust gate.
+          return ghostLine.renderInlineOverlay()
         },
       })
       if (typeof appSlotResult?.dispose === "function") stopAppSlot = appSlotResult.dispose
       else if (typeof appSlotResult === "function") stopAppSlot = appSlotResult
     } catch (error) {
+      recordFailure("slot.app", error)
       console.warn("[opencode-history-ghost] app slot registration failed:", error)
     }
 
@@ -197,22 +286,25 @@ export default Plugin.define({
       if (typeof slotResult?.dispose === "function") stopComposerSlot = slotResult.dispose
       else if (typeof slotResult === "function") stopComposerSlot = slotResult
     } catch (error) {
+      recordFailure("slot.session.composer.top", error)
       console.warn("[opencode-history-ghost] composer slot registration failed:", error)
     }
 
     // ---- History refresh: jsonl mtime poll covers prompts that were just
     // submitted but are not in the DB yet (DESIGN §2).
     const historyRefreshTimer = setInterval(() => {
+      if (disposed) return
       try {
         historySource.refresh()
+        reassessChangedHistory()
       } catch (error) {
+        recordFailure("history.refresh", error)
         console.warn("[opencode-history-ghost] history refresh failed:", error)
       }
     }, HISTORY_REFRESH_INTERVAL_MS)
 
     // ---- Cleanup: every registered resource is released exactly once,
     // whether the host calls the setup() return value or not.
-    let disposed = false
     function disposeAll(): void {
       if (disposed) return
       disposed = true
@@ -222,11 +314,15 @@ export default Plugin.define({
       stopCaretListening()
       stopForeignFocusListening()
       editorBridge.dispose()
+      composerIdentity.dispose()
       keymapCleanup?.()
       stopAppSlot?.()
       stopComposerSlot?.()
+      stopIdentitySlot?.()
     }
 
     return disposeAll
   },
 })
+
+

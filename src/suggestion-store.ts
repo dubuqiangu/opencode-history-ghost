@@ -29,7 +29,7 @@
 //      index and only move `input`; the matcher does not re-run.
 
 import type { HistoryEntry } from "./history-source"
-import { findCandidates } from "./matcher"
+import { findCandidates, meetsInputLengthRequirement } from "./matcher"
 
 /**
  * Persisted plugin settings (DESIGN §3.8). At runtime this is the reactive
@@ -67,6 +67,8 @@ export interface SuggestionState {
 export interface SuggestionStoreApi {
   /** Re-runs the suggestion pipeline for the given raw editor text. */
   evaluate(rawInput: string): void
+  /** History changed independently of typing; bypasses the repeated-input and incremental fast paths. */
+  reassess(rawInput: string): void
   /** Moves the candidate ring by one step (ctrl+down / ctrl+up). */
   cycle(direction: 1 | -1): void
   /** Drops the suggestion without recording a dismissal (post-accept). */
@@ -84,6 +86,16 @@ export interface SuggestionStoreApi {
    * the return value unsubscribes. The imperative UI pipeline hooks in here.
    */
   onStateChange(listener: () => void): () => void
+}
+
+/**
+ * Single source of truth for the minimum-input gate: Chinese-only input needs
+ * two grapheme units, everything else needs `minChars` (default 3). Behavior
+ * matches the matcher's `meetsInputLengthRequirement` so the store and the
+ * matcher never diverge.
+ */
+export function passesMinInput(text: string, minChars: number): boolean {
+  return meetsInputLengthRequirement(text, minChars)
 }
 
 export function createSuggestionStore(
@@ -108,15 +120,16 @@ export function createSuggestionStore(
     }
   }
 
-  return {
-    evaluate(rawInput: string): void {
-      try {
+  function evaluateInput(rawInput: string, historyChanged: boolean): void {
+    try {
         if (!settings.enabled) {
           commitState(null)
           return
         }
         const trimmedInput = rawInput.trim()
-        if (trimmedInput.length === 0 || trimmedInput.length < settings.minChars) {
+        // 与 matcher 共用同一长度判定：按文字单元计数，纯 CJK 输入阈值 2，其余用
+        // settings.minChars（默认 3）。这里只做提前短路，真正的判定仍在 matcher。
+        if (!passesMinInput(trimmedInput, settings.minChars)) {
           commitState(null)
           return
         }
@@ -137,14 +150,16 @@ export function createSuggestionStore(
         const previousState = currentState
         if (previousState) {
           // Nothing changed (e.g. a repeated event): keep the current line.
-          if (previousState.input === trimmedInput) return
+          if (!historyChanged && previousState.input === trimmedInput) return
           const shownCandidate = previousState.candidates[previousState.index]
           const inputOnlyExtended =
             trimmedInput.length > previousState.input.length && trimmedInput.startsWith(previousState.input)
           if (
+            !historyChanged &&
             shownCandidate &&
             inputOnlyExtended &&
-            shownCandidate.lower.startsWith(trimmedInput.toLowerCase())
+            shownCandidate.lower.startsWith(trimmedInput.toLowerCase()) &&
+            shownCandidate.text !== trimmedInput
           ) {
             // Fast path: the typed text still prefixes the shown candidate —
             // keep list and index, only move `input` (anti-flicker).
@@ -157,12 +172,19 @@ export function createSuggestionStore(
           maxCandidates: settings.maxCandidates,
           excludePrefixes: settings.excludePrefixes,
         })
+        if (historyChanged && previousState?.input === trimmedInput &&
+          candidates.length === previousState.candidates.length &&
+          candidates.every((candidate, index) => candidate.text === previousState.candidates[index].text)) return
         commitState(candidates.length === 0 ? null : { input: trimmedInput, candidates, index: 0 })
-      } catch (error) {
-        console.warn("[opencode-history-ghost] suggestion evaluation failed:", error)
-        commitState(null)
-      }
-    },
+    } catch (error) {
+      console.warn("[opencode-history-ghost] suggestion evaluation failed:", error)
+      commitState(null)
+    }
+  }
+
+  return {
+    evaluate(rawInput: string): void { evaluateInput(rawInput, false) },
+    reassess(rawInput: string): void { evaluateInput(rawInput, true) },
     cycle(direction: 1 | -1): void {
       const storeState = currentState
       if (!storeState || storeState.candidates.length === 0) return

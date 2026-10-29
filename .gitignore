@@ -1,1 +1,5 @@
 node_modules/
+
+# Transient runtime diagnostics (written by src/probe-log.ts / src/context-probe.ts
+# on each host launch; content varies per run and is not part of the deliverable).
+probe-*.txt

@@ -1,8 +1,9 @@
 // Editor access bridge for opencode-history-ghost (T5, DESIGN §3.3; defect-3/4 fix).
 //
-// Every editor access goes through renderer.currentFocusedEditor — a
+// Editor access requires an independently proven composer identity; the
 // semi-official surface (see @opentui/core renderer.d.ts:418 and
-// EditBufferRenderable.d.ts for plainText/cursorOffset/replaceText). The
+// EditBufferRenderable.d.ts for plainText/cursorOffset/replaceText; the
+// native edit-buffer.d.ts provides getTextRange/measureText). The
 // whole module is defensive by contract: optional chaining at every step,
 // isDestroyed checks before each editor operation, warn-once error
 // swallowing — a broken host integration must never crash the TUI.
@@ -21,27 +22,18 @@
 //     listener otherwise — the stale saved original is dropped, never
 //     restored over the host's fresher assignment. Failure window <= 1.5s.
 //
-// TRUSTED-COMPOSER POLICY (defect-2 fix): OpenCode's dialogs (rename, prompt,
-// ...) and the sidebar search also use EditBuffer renderables, so blindly
-// following focus would let the plugin hijack their typing. The host only
-// ever swaps the composer textarea through destroy-then-rebuild (verified
-// behavior on session/mode switches), while a dialog input takes focus with
-// the composer instance still ALIVE. This distinguishes both cases with zero
-// host-internal guessing:
-//   - focus moved to a different editor while our wrapped instance is still
-//     alive → foreign surface: never wrap it, notify onForeignEditorFocus
-//     (no ghost line, no Tab/Esc interference there);
-//   - the wrapped instance died → the new focused editor is the rebuilt
-//     composer: adopt it.
-// The keymap commands additionally re-verify editor text consistency at
-// run() time (see keymap.ts), which closes the <= 1.5s poll race window.
+// TRUSTED-COMPOSER POLICY: focus and editor lifetime are NOT identity.
+// The prompt.footer marker's structural proof is checked on every read and
+// write; only the poll may install listener wrappers on a proven editor.
 
 /** Structural subset of EditBufferRenderable that this plugin relies on. */
 export interface EditBufferLike {
   /** Full editor content (code units, multi-line preserved). */
   readonly plainText: string
-  /** Absolute caret position in code units. */
+  /** Display-cell caret offset on real OpenTUI textareas. */
   readonly cursorOffset: number
+  /** Native buffer offsets are display cells (including line breaks). */
+  readonly editBuffer?: { measureText(text: string): number; getTextRange(start: number, end: number): string }
   /** Replaces the whole buffer content while preserving undo history. */
   replaceText(text: string): void
   /** True once the renderable has been destroyed by the host. */
@@ -57,7 +49,11 @@ export interface EditorBridge {
   current(): EditBufferLike | null
   /** Reads the current input text; null when no live editor. */
   inputText(): string | null
-  /** True when the caret sits at the very end of the input. */
+  /** Current trustworthy text and cursor prefix; null for ambiguous offsets. */
+  caretSnapshot(): EditorSnapshot | null
+  /** Current cursor prefix; never treats a display-cell offset as a JS index. */
+  caretPrefix(): string | null
+  /** Legacy end-of-input probe (new matching uses caretSnapshot). */
   cursorAtEnd(): boolean
   /** Replaces the input with the accepted suggestion text; false on failure. */
   acceptFullText(text: string): boolean
@@ -65,23 +61,25 @@ export interface EditorBridge {
   onInput(handler: (text: string) => void): () => void
   /**
    * Subscribes to caret moves; the handler receives whether the caret sits
-   * at the end of the input after the move. Used to collapse suggestions the
-   * moment the caret leaves the end (DESIGN §4), which typing alone cannot
-   * detect.
+   * at the end after the move. Consumers re-read the native cursor prefix
+   * on every move (pure moves do not trigger content changes).
    */
   onCaretMove(handler: (caretAtEnd: boolean) => void): () => void
   /**
-   * Subscribes to focus landing on an editor OTHER than the wrapped one
-   * while the wrapped instance is still alive — dialog inputs, sidebar
-   * search, any foreign EditBuffer surface. The handler receives that
-   * editor. Consumers collapse their UI here so nothing lingers during
-   * dialogs (defect-2 fix).
+   * Receives a foreign editor or null when focus leaves all editors.
    */
-  onForeignEditorFocus(handler: (foreignEditor: EditBufferLike) => void): () => void
+  onForeignEditorFocus(handler: (foreignEditor: EditBufferLike | null) => void): () => void
   /** Starts the 1.5s focused-editor identity poll that keeps the hooks alive. */
   watch(): void
   /** Removes every hook, subscription, and timer. Idempotent. */
   dispose(): void
+}
+
+export interface EditorSnapshot {
+  readonly editor: EditBufferLike
+  readonly text: string
+  readonly prefix: string
+  readonly offset: number
 }
 
 /**
@@ -128,7 +126,7 @@ function unwrapInstalledWrapper(
 ): ((event: unknown) => void) | undefined {
   if (typeof slotValue !== "function") return slotValue
   const slotRecord = slotValue as PossiblyWrappedListener
-  if (slotRecord[installedWrapperSymbol] === undefined) return slotValue
+  if (!Object.prototype.hasOwnProperty.call(slotRecord, installedWrapperSymbol)) return slotValue
   return slotRecord[installedWrapperSymbol]
 }
 
@@ -151,17 +149,52 @@ function focusedEditor(context: unknown): EditBufferLike | null {
   }
 }
 
-export function createEditorBridge(context: unknown): EditorBridge {
+export function createEditorBridge(context: unknown, identity: { resolve(): EditBufferLike | null }): EditorBridge {
   const inputHandlers = new Set<(text: string) => void>()
   const caretMoveHandlers = new Set<(caretAtEnd: boolean) => void>()
-  const foreignEditorFocusHandlers = new Set<(foreignEditor: EditBufferLike) => void>()
+  const foreignEditorFocusHandlers = new Set<(foreignEditor: EditBufferLike | null) => void>()
   let wrappedEditor: EditBufferLike | null = null
   let originalOnContentChange: ((event: unknown) => void) | undefined
   let installedContentChangeWrapper: ((event: unknown) => void) | undefined
   let originalOnCursorChange: ((event: unknown) => void) | undefined
   let installedCursorChangeWrapper: ((event: unknown) => void) | undefined
   let identityPollTimer: ReturnType<typeof setInterval> | undefined
+  let stopFocusListening: (() => void) | undefined
+  // undefined means the last observed focus was trusted; null is a blur.
+  let lastUntrustedFocus: EditBufferLike | null | undefined
   let disposed = false
+
+  function snapshot(editor: EditBufferLike): EditorSnapshot | null {
+    const text = editor.plainText
+    const offset = editor.cursorOffset
+    if (!Number.isSafeInteger(offset) || offset < 0) return null
+    const buffer = editor.editBuffer
+    if (buffer && typeof buffer.measureText === "function" && typeof buffer.getTextRange === "function") {
+      const end = buffer.measureText(text)
+      if (offset > end) return null
+      const prefix = buffer.getTextRange(0, offset)
+      const suffix = buffer.getTextRange(offset, end)
+      // Native grapheme boundaries, tabs, CRLF and display-cell widths are
+      // authoritative; reject inconsistent/native-mid-cell values outright.
+      if (prefix + suffix !== text || buffer.measureText(prefix) !== offset) return null
+      return { editor, text, prefix, offset }
+    }
+    // Fake/legacy buffers can prove only a JS-code-unit end, never an interior
+    // display-cell mapping. Preserve their end-of-input behavior only.
+    if (!buffer && offset === text.length) return { editor, text, prefix: text, offset }
+    return null
+  }
+
+  /** SDK offsets are display cells, not UTF-16/code-point counts. Fake editors
+   * without an SDK buffer retain their original code-unit convention. */
+  function caretAtTextEnd(editor: EditBufferLike): boolean {
+    const text = editor.plainText
+    const measureText = editor.editBuffer?.measureText
+    if (typeof measureText === "function") {
+      return editor.cursorOffset >= measureText.call(editor.editBuffer, text)
+    }
+    return editor.cursorOffset >= text.length
+  }
 
   /** Fan-out of the latest editor text to every subscriber, each guarded. */
   function notifyInput(editor: EditBufferLike): void {
@@ -187,7 +220,7 @@ export function createEditorBridge(context: unknown): EditorBridge {
     if (caretMoveHandlers.size === 0) return
     let caretAtEnd: boolean
     try {
-      caretAtEnd = editor.cursorOffset >= editor.plainText.length
+      caretAtEnd = caretAtTextEnd(editor)
     } catch (error) {
       warnOnce("failed to read the caret position:", error)
       return
@@ -235,19 +268,20 @@ export function createEditorBridge(context: unknown): EditorBridge {
       // (migrated by the host, or left by an earlier install cycle), unwrap
       // it and chain onto the true host listener — never wrapper-on-wrapper.
       originalOnContentChange = unwrapInstalledWrapper(editor.onContentChange)
+      const capturedHostContentChange = originalOnContentChange
       installedContentChangeWrapper = (event: unknown) => {
-        if (originalOnContentChange) {
+        if (capturedHostContentChange) {
           try {
-            originalOnContentChange(event)
+            capturedHostContentChange(event)
           } catch (error) {
             warnOnce("the host onContentChange listener failed:", error)
           }
         }
-        if ((capturedEditor as { isDestroyed?: boolean }).isDestroyed === true) return
+        if (capturedEditor.isDestroyed === true || wrappedEditor !== capturedEditor || identity.resolve() !== capturedEditor) return
         notifyInput(capturedEditor)
       }
       ;(installedContentChangeWrapper as PossiblyWrappedListener)[installedWrapperSymbol] =
-        originalOnContentChange
+        capturedHostContentChange
       try {
         editor.onContentChange = installedContentChangeWrapper
       } catch (error) {
@@ -260,19 +294,20 @@ export function createEditorBridge(context: unknown): EditorBridge {
       // Self-reference guard: same unwrap-before-chain rule as the content
       // slot above.
       originalOnCursorChange = unwrapInstalledWrapper(editor.onCursorChange)
+      const capturedHostCursorChange = originalOnCursorChange
       installedCursorChangeWrapper = (event: unknown) => {
-        if (originalOnCursorChange) {
+        if (capturedHostCursorChange) {
           try {
-            originalOnCursorChange(event)
+            capturedHostCursorChange(event)
           } catch (error) {
             warnOnce("the host onCursorChange listener failed:", error)
           }
         }
-        if ((capturedEditor as { isDestroyed?: boolean }).isDestroyed === true) return
+        if (capturedEditor.isDestroyed === true || wrappedEditor !== capturedEditor || identity.resolve() !== capturedEditor) return
         notifyCaretMove(capturedEditor)
       }
       ;(installedCursorChangeWrapper as PossiblyWrappedListener)[installedWrapperSymbol] =
-        originalOnCursorChange
+        capturedHostCursorChange
       try {
         editor.onCursorChange = installedCursorChangeWrapper
       } catch (error) {
@@ -311,8 +346,11 @@ export function createEditorBridge(context: unknown): EditorBridge {
     installedCursorChangeWrapper = undefined
   }
 
-  /** Fan-out of foreign-surface focus events, each subscriber guarded. */
-  function notifyForeignEditorFocus(foreignEditor: EditBufferLike): void {
+  /** One notification per untrusted transition; polling must not repeatedly
+   * clear an already-cleared suggestion or disrupt a newly proven composer. */
+  function notifyUntrustedFocus(foreignEditor: EditBufferLike | null): void {
+    if (foreignEditor === lastUntrustedFocus) return
+    lastUntrustedFocus = foreignEditor
     if (foreignEditorFocusHandlers.size === 0) return
     for (const foreignFocusHandler of foreignEditorFocusHandlers) {
       try {
@@ -323,20 +361,10 @@ export function createEditorBridge(context: unknown): EditorBridge {
     }
   }
 
-  /**
-   * Installs the hooks on the given editor ONLY when it is a legitimate
-   * composer target (defect-2 fix, see the trust policy in the header):
-   *   - the wrapped instance is still alive and a DIFFERENT editor took the
-   *     focus → a dialog/sidebar input: never wrap it, notify and bail;
-   *   - nothing wrapped yet (first run) or the wrapped instance died (host
-   *     rebuilt the composer textarea) → adopt the focused editor.
-   */
-  function attachEditorIfTrusted(editor: EditBufferLike): void {
-    if (wrappedEditor && editor !== wrappedEditor && wrappedEditor.isDestroyed === false) {
-      notifyForeignEditorFocus(editor)
-      return
-    }
-    installEditorHooks(editor)
+  /** Queries are read-only. Only the poll installs or repairs hooks. */
+  function trustedFocusedEditor(): EditBufferLike | null {
+    if (disposed) return null
+    return identity.resolve()
   }
 
   /**
@@ -346,7 +374,10 @@ export function createEditorBridge(context: unknown): EditorBridge {
    */
   function runIdentityPoll(): void {
     try {
-      const editor = focusedEditor(context)
+      const editor = identity.resolve()
+      if (editor) lastUntrustedFocus = undefined
+      else notifyUntrustedFocus(focusedEditor(context))
+      if (wrappedEditor && (wrappedEditor.isDestroyed || (editor && wrappedEditor !== editor))) detachEditorHooks()
       if (editor && editor === wrappedEditor) {
         // Same instance — also detect the host having re-assigned either
         // listener slot on it; re-chain onto the newest listeners then.
@@ -355,19 +386,15 @@ export function createEditorBridge(context: unknown): EditorBridge {
         return
       }
       if (editor) {
-        // Different editor took the focus. Trusted adoption decides:
-        // a live wrapped composer means this is a dialog/sidebar input
-        // (notify, never wrap); a dead wrapped instance means the host
-        // rebuilt the composer textarea (adopt the new one).
-        attachEditorIfTrusted(editor)
+       // A proven editor, never a guessed replacement.
+        installEditorHooks(editor)
+        notifyInput(editor)
         return
       }
       // Nothing focused: only drop the hooks if the wrapped editor died,
       // so a temporary blur (sidebar focus etc.) does not cause a
       // needless detach/re-attach cycle.
-      if ((wrappedEditor as { isDestroyed?: boolean } | null)?.isDestroyed === true) {
-        detachEditorHooks()
-      }
+      if (wrappedEditor?.isDestroyed === true) detachEditorHooks()
     } catch (error) {
       warnOnce("editor identity poll failed:", error)
     }
@@ -375,10 +402,10 @@ export function createEditorBridge(context: unknown): EditorBridge {
 
   const bridge: EditorBridge = {
     current(): EditBufferLike | null {
-      return focusedEditor(context)
+      return trustedFocusedEditor()
     },
     inputText(): string | null {
-      const editor = focusedEditor(context)
+      const editor = trustedFocusedEditor()
       if (!editor) return null
       try {
         return editor.plainText
@@ -387,18 +414,31 @@ export function createEditorBridge(context: unknown): EditorBridge {
         return null
       }
     },
+    caretSnapshot(): EditorSnapshot | null {
+      const editor = trustedFocusedEditor()
+      if (!editor) return null
+      try {
+        return snapshot(editor)
+      } catch (error) {
+        warnOnce("failed to read the caret prefix:", error)
+        return null
+      }
+    },
+    caretPrefix(): string | null {
+      return bridge.caretSnapshot()?.prefix ?? null
+    },
     cursorAtEnd(): boolean {
-      const editor = focusedEditor(context)
+      const editor = trustedFocusedEditor()
       if (!editor) return false
       try {
-        return editor.cursorOffset >= editor.plainText.length
+        return caretAtTextEnd(editor)
       } catch (error) {
         warnOnce("failed to read the caret position:", error)
         return false
       }
     },
     acceptFullText(text: string): boolean {
-      const editor = focusedEditor(context)
+      const editor = trustedFocusedEditor()
       if (!editor) return false
       try {
         editor.replaceText(text)
@@ -410,24 +450,17 @@ export function createEditorBridge(context: unknown): EditorBridge {
     },
     onInput(inputHandler: (text: string) => void): () => void {
       inputHandlers.add(inputHandler)
-      // Hook lazily on first subscription so an unused bridge never touches
-      // host state. Trusted adoption only: a dialog input focused at this
-      // moment is still refused (see attachEditorIfTrusted).
-      const editor = focusedEditor(context)
-      if (editor) attachEditorIfTrusted(editor)
       return () => {
         inputHandlers.delete(inputHandler)
       }
     },
     onCaretMove(caretMoveHandler: (caretAtEnd: boolean) => void): () => void {
       caretMoveHandlers.add(caretMoveHandler)
-      const editor = focusedEditor(context)
-      if (editor) attachEditorIfTrusted(editor)
       return () => {
         caretMoveHandlers.delete(caretMoveHandler)
       }
     },
-    onForeignEditorFocus(foreignFocusHandler: (foreignEditor: EditBufferLike) => void): () => void {
+    onForeignEditorFocus(foreignFocusHandler: (foreignEditor: EditBufferLike | null) => void): () => void {
       foreignEditorFocusHandlers.add(foreignFocusHandler)
       return () => {
         foreignEditorFocusHandlers.delete(foreignFocusHandler)
@@ -435,11 +468,31 @@ export function createEditorBridge(context: unknown): EditorBridge {
     },
     watch(): void {
       if (identityPollTimer !== undefined || disposed) return
+      // OpenTUI emits a focused-editor change synchronously. Clear stale
+      // suggestions at focus time, not after the 1.5s repair interval.
+      try {
+        const renderer = (context as { renderer?: {
+          on?: (event: string, handler: () => void) => void
+          off?: (event: string, handler: () => void) => void
+        } })?.renderer
+        if (renderer?.on && renderer?.off) {
+          const onFocusChange = () => {
+            const focused = focusedEditor(context)
+            if (identity.resolve() === focused && focused) lastUntrustedFocus = undefined
+            else notifyUntrustedFocus(focused)
+          }
+          renderer.on("focused_editor", onFocusChange)
+          stopFocusListening = () => renderer.off?.("focused_editor", onFocusChange)
+        }
+      } catch (error) {
+        warnOnce("failed to subscribe to editor focus changes:", error)
+      }
       identityPollTimer = setInterval(runIdentityPoll, 1500)
     },
     dispose(): void {
       if (disposed) return
       disposed = true
+      stopFocusListening?.()
       if (identityPollTimer !== undefined) {
         clearInterval(identityPollTimer)
         identityPollTimer = undefined

@@ -23,6 +23,7 @@
 
 import type { HistoryGhostSettings, SuggestionState, SuggestionStoreApi } from "./suggestion-store"
 import type { HistoryEntry } from "./history-source"
+import { createInlineGhostOverlay, type InlineEditorSource } from "./ghost-overlay-render"
 
 /** Display cap per line, in code units, before the ellipsis (DESIGN §3.5). */
 const MAX_DISPLAY_CODE_UNITS = 100
@@ -32,16 +33,24 @@ export interface GhostLineDeps {
   readonly settings: HistoryGhostSettings
   /** ResolvedTheme from the plugin context; accessed defensively. */
   readonly theme: unknown
+  /**
+   * Optional access to the proven composer textarea. When present the
+   * suggestion is also drawn inside the input (grey suffix after the caret);
+   * when absent the row above the composer alone carries it.
+   */
+  readonly editorSource?: InlineEditorSource | null
 }
 
 /** Structural slice of TextRenderable this controller patches imperatively. */
 interface MutableTextRenderable {
   content: string
+  readonly isDestroyed: boolean
 }
 
 /** Structural slice of Renderable used to collapse the whole row. */
 interface VisibilityRenderable {
   visible: boolean
+  readonly isDestroyed: boolean
 }
 
 type GhostTextFieldName = "leadingDim" | "typedMatch" | "trailingDim" | "multilineNote" | "hint"
@@ -107,6 +116,12 @@ export interface GhostLineController {
   renderRow(): unknown
   /** Re-patches the captured renderables from the store's current state. */
   refresh(): void
+  /**
+   * Static inline overlay for the `app` slot: the untyped suffix drawn over
+   * the composer in muted grey. Returns null when no editor source was
+   * injected, so callers can mount it unconditionally.
+   */
+  renderInlineOverlay(): unknown
 }
 
 export function createGhostLine(deps: GhostLineDeps): GhostLineController {
@@ -114,77 +129,101 @@ export function createGhostLine(deps: GhostLineDeps): GhostLineController {
   const dimColor = themeText?.muted ?? "gray"
   const baseColor = themeText?.base
 
-  let rowBox: VisibilityRenderable | null = null
-  const textRenderables: Record<GhostTextFieldName, MutableTextRenderable | null> = {
-    leadingDim: null,
-    typedMatch: null,
-    trailingDim: null,
-    multilineNote: null,
-    hint: null,
+  // Each call produces a separate mount. The host can retain more than one
+  // row on the same renderer, so keep all fully captured, live rows in sync.
+  interface MountedRow {
+    rowBox: VisibilityRenderable | null
+    textRenderables: Record<GhostTextFieldName, MutableTextRenderable | null>
   }
+  const mountedRows = new Set<MountedRow>()
 
-  /** Patches every captured renderable from the store's current state. */
-  function patchFromState(): void {
-    if (!rowBox) return
+  // Inline overlay is opt-in through the injected editor source; it degrades to
+  // a no-op controller when the assembly cannot hand us a trustworthy textarea.
+  const inlineOverlay = deps.editorSource
+    ? createInlineGhostOverlay({ store: deps.store, editorSource: deps.editorSource, theme: deps.theme })
+    : null
+
+  /** Patches only complete, live rows; discarded rows are pruned on refresh. */
+  function patchFromState(mount: MountedRow): void {
+    const textRenderables = Object.values(mount.textRenderables)
+    if (!mount.rowBox || textRenderables.some((renderable) => !renderable)) return
+    if (mount.rowBox.isDestroyed || textRenderables.some((renderable) => renderable!.isDestroyed)) {
+      mountedRows.delete(mount)
+      return
+    }
+    mountedRows.add(mount)
     const suggestionState = deps.store.state()
     const candidate = suggestionState?.candidates[suggestionState.index]
     if (!suggestionState || !candidate) {
       // No suggestion: collapse the whole row (invisible renderables are
       // skipped by layout).
-      rowBox.visible = false
+      mount.rowBox.visible = false
       return
     }
-    rowBox.visible = true
+    mount.rowBox.visible = true
     const segments = computeSegments(deps.settings, suggestionState, candidate)
-    for (const fieldName of Object.keys(textRenderables) as GhostTextFieldName[]) {
-      const textRenderable = textRenderables[fieldName]
-      if (textRenderable) textRenderable.content = segments[fieldName]
+    for (const fieldName of Object.keys(mount.textRenderables) as GhostTextFieldName[]) {
+      mount.textRenderables[fieldName]!.content = segments[fieldName]
     }
   }
 
-  function retainTextRenderable(fieldName: GhostTextFieldName, renderable: unknown): void {
-    textRenderables[fieldName] = renderable as MutableTextRenderable
-    // Mount-time state displays immediately: refs fire during the slot
-    // render, so patch right after every capture.
-    patchFromState()
+  function retainTextRenderable(mount: MountedRow, fieldName: GhostTextFieldName, renderable: unknown): void {
+    mount.textRenderables[fieldName] = (renderable as MutableTextRenderable | null) ?? null
+    // Ref callbacks may arrive while a row is still being built. Only patch
+    // after all nodes have arrived, including the parent box.
+    patchFromState(mount)
   }
 
   return {
     renderRow(): unknown {
+      const mount: MountedRow = {
+        rowBox: null,
+        textRenderables: {
+          leadingDim: null,
+          typedMatch: null,
+          trailingDim: null,
+          multilineNote: null,
+          hint: null,
+        },
+      }
       return (
         <box
           flexDirection="row"
           ref={(rowRenderable: unknown) => {
-            rowBox = rowRenderable as VisibilityRenderable
-            patchFromState()
+            mount.rowBox = (rowRenderable as VisibilityRenderable | null) ?? null
+            patchFromState(mount)
           }}
         >
           <text
             fg={dimColor}
-            ref={(textRenderable: unknown) => retainTextRenderable("leadingDim", textRenderable)}
+            ref={(textRenderable: unknown) => retainTextRenderable(mount, "leadingDim", textRenderable)}
           />
           <text
             fg={baseColor}
-            ref={(textRenderable: unknown) => retainTextRenderable("typedMatch", textRenderable)}
+            ref={(textRenderable: unknown) => retainTextRenderable(mount, "typedMatch", textRenderable)}
           />
           <text
             fg={dimColor}
-            ref={(textRenderable: unknown) => retainTextRenderable("trailingDim", textRenderable)}
+            ref={(textRenderable: unknown) => retainTextRenderable(mount, "trailingDim", textRenderable)}
           />
           <text
             fg={dimColor}
-            ref={(textRenderable: unknown) => retainTextRenderable("multilineNote", textRenderable)}
+            ref={(textRenderable: unknown) => retainTextRenderable(mount, "multilineNote", textRenderable)}
           />
-          <box flexGrow={1} />
+          <box flexGrow={1} flexShrink={0} />
           <text
             fg={dimColor}
-            ref={(textRenderable: unknown) => retainTextRenderable("hint", textRenderable)}
+            ref={(textRenderable: unknown) => retainTextRenderable(mount, "hint", textRenderable)}
           />
         </box>
       )
     },
     refresh(): void {
-      patchFromState()
+      for (const mount of mountedRows) patchFromState(mount)
+      inlineOverlay?.refresh()
+    },
+    renderInlineOverlay(): unknown {
+      return inlineOverlay ? inlineOverlay.renderOverlay() : null
     },
   }
 }

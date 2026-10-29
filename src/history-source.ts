@@ -7,12 +7,13 @@
  *
  * 降级链：bun:sqlite > node:sqlite > jsonl-only（warn 一次，绝不抛错崩宿主）。
  * refresh() 只做 jsonl mtime 变化检测，DB 只在初始化时加载一次。
- * DB 查询带 LIMIT maxEntries（新到旧），只物化最新条目，避免启动期全量扫描大库。
+ * DB 分批查询最新行，过滤去重后达到 maxEntries 即停止，避免一次物化整个大库。
  */
 
 import * as nodeFs from "node:fs"
 import * as nodeOs from "node:os"
 import * as nodePath from "node:path"
+import { setImmediate as yieldToEventLoop } from "node:timers/promises"
 
 export interface HistoryEntry {
   /** 原文（多行保留原样） */
@@ -22,7 +23,7 @@ export interface HistoryEntry {
 }
 
 export interface HistorySource {
-  /** 最新在前；已去重、已过滤、已截断到上限 */
+  /** 最新在前；已去重、已过滤、已截断到上限。候选文本/顺序变化时才替换数组引用。 */
   entries(): HistoryEntry[]
   /** jsonl mtime 变化时重新合并；由外层定时调用，内部有变化检测 */
   refresh(): void
@@ -41,7 +42,7 @@ export interface HistorySourceOptions {
 export interface HistorySourceReadStats {
   /** jsonl 文件被完整重读的次数 */
   jsonlReads: number
-  /** DB 用户消息查询执行次数（设计为 0 或 1） */
+  /** DB 初始化加载次数（设计为 0 或 1；一次加载可能执行多次分页查询） */
   databaseLoads: number
 }
 
@@ -69,6 +70,8 @@ const DEFAULT_PROMPT_HISTORY_JSONL_PATH = nodePath.join(
 interface SqliteStatementAdapter {
   /** 位置参数绑定执行（bun:sqlite 与 node:sqlite 均支持匿名位置参数） */
   all(...boundParameters: unknown[]): Array<Record<string, unknown>>
+  /** Bun explicitly releases prepared statement handles; Node may omit it. */
+  finalize?(): void
 }
 
 interface SqliteDatabaseAdapter {
@@ -144,7 +147,7 @@ class SqliteAndJsonlHistorySource implements HistorySource {
     }
     const database = openOutcome.database
     try {
-      this.databaseTexts = readUserTextsFromDatabase(database, this.maxEntries)
+      this.databaseTexts = await readUserTextsFromDatabase(database, this.maxEntries, this.maxTextLength)
       this.databaseLoadCount += 1
       this.rebuildMergedEntries()
     } catch (queryError) {
@@ -177,10 +180,18 @@ class SqliteAndJsonlHistorySource implements HistorySource {
   private rebuildMergedEntries(): void {
     const seenTexts = new Set<string>()
     const mergedEntries: HistoryEntry[] = []
-    // jsonl（最新）在前，DB 在后；Map/Set 去重保留首个出现即最新
-    for (const text of this.jsonlTexts) this.appendFilteredEntry(text, seenTexts, mergedEntries)
-    for (const text of this.databaseTexts) this.appendFilteredEntry(text, seenTexts, mergedEntries)
-    this.mergedEntries = mergedEntries.slice(0, this.maxEntries)
+    // jsonl > V2 > legacy；各来源内部最新在前，跨来源不比较时间戳。
+    for (const text of this.jsonlTexts) {
+      if (mergedEntries.length >= this.maxEntries) break
+      this.appendFilteredEntry(text, seenTexts, mergedEntries)
+    }
+    for (const text of this.databaseTexts) {
+      if (mergedEntries.length >= this.maxEntries) break
+      this.appendFilteredEntry(text, seenTexts, mergedEntries)
+    }
+    if (mergedEntries.length === this.mergedEntries.length &&
+      mergedEntries.every((entry, index) => entry.text === this.mergedEntries[index].text)) return
+    this.mergedEntries = mergedEntries
   }
 
   private appendFilteredEntry(
@@ -286,32 +297,139 @@ function describeUnderlyingError(error: unknown): string {
   return `${rawMessage.slice(0, truncatedLength)}…`
 }
 
-/** schema 自适应：先试 V2 session_message，失败再试 V1 legacy message JOIN part，都失败抛错由调用方降级 */
-function readUserTextsFromDatabase(database: SqliteDatabaseAdapter, rowLimit: number): string[] {
-  try {
-    return readUserTextsFromSessionMessageTable(database, rowLimit)
-  } catch {
-    // V2 表不存在或查询失败：尝试 V1 legacy
-  }
-  return readUserTextsFromLegacyMessagePartTables(database, rowLimit)
-}
-
-/** 只物化最新 rowLimit 条 user 行（LIMIT 参数绑定，新到旧语义不变），避免全量物化大库所有行 */
-function readUserTextsFromSessionMessageTable(
+/**
+ * Source precedence is jsonl > V2 > legacy. Each DB table is newest-first internally;
+ * timestamps across tables are deliberately NOT compared (their epochs may differ).
+ * Only normalized, filtered unique texts count toward the bound. Each query holds at
+ * most one page; scans stop as soon as the retained set reaches the requested bound.
+ */
+async function readUserTextsFromDatabase(
   database: SqliteDatabaseAdapter,
-  rowLimit: number,
-): string[] {
-  const rows = database
-    .prepare(
-      "SELECT data FROM session_message WHERE type = 'user' ORDER BY time_created DESC LIMIT ?",
-    )
-    .all(rowLimit)
-  const userTexts: string[] = []
-  for (const row of rows) {
-    const extractedText = extractTextFromSessionMessageData(row["data"])
-    if (extractedText !== null) userTexts.push(extractedText)
+  maxEntries: number,
+  maxTextLength: number,
+): Promise<string[]> {
+  if (maxEntries === 0) return []
+  const retainedTexts: string[] = []
+  const seenTexts = new Set<string>()
+  const sources = [
+    {
+      firstPageSql: "SELECT data, time_created AS sortTime, rowid AS messageRowId FROM session_message WHERE type = 'user' AND time_created IS NOT NULL ORDER BY time_created DESC, rowid DESC LIMIT ?",
+      nextPageSql: `SELECT data, time_created AS sortTime, rowid AS messageRowId FROM session_message
+        WHERE type = 'user' AND (time_created, rowid) < (?, ?)
+        ORDER BY time_created DESC, rowid DESC LIMIT ?`,
+      firstNullPageSql: `SELECT data, time_created AS sortTime, rowid AS messageRowId FROM session_message
+        WHERE type = 'user' AND time_created IS NULL ORDER BY time_created DESC, rowid DESC LIMIT ?`,
+      nullTimePageSql: `SELECT data, time_created AS sortTime, rowid AS messageRowId FROM session_message
+        WHERE type = 'user' AND time_created IS NULL AND rowid < ?
+        ORDER BY time_created DESC, rowid DESC LIMIT ?`,
+      column: "data",
+      extract: extractTextFromSessionMessageData,
+      hasPartRowId: false,
+    },
+    {
+      firstPageSql: `SELECT part.data AS partData, message.time_created AS sortTime,
+          message.rowid AS messageRowId, part.rowid AS partRowId FROM message
+        JOIN part ON part.message_id = message.id
+        WHERE message.data LIKE '%"role":"user"%' AND message.time_created IS NOT NULL
+        ORDER BY message.time_created DESC, message.rowid DESC, part.rowid DESC
+        LIMIT ?`,
+      nextPageSql: `SELECT part.data AS partData, message.time_created AS sortTime,
+          message.rowid AS messageRowId, part.rowid AS partRowId FROM message
+        JOIN part ON part.message_id = message.id
+        WHERE message.data LIKE '%"role":"user"%' AND
+          (message.time_created, message.rowid, part.rowid) < (?, ?, ?)
+        ORDER BY message.time_created DESC, message.rowid DESC, part.rowid DESC LIMIT ?`,
+      firstNullPageSql: `SELECT part.data AS partData, message.time_created AS sortTime,
+          message.rowid AS messageRowId, part.rowid AS partRowId FROM message
+        JOIN part ON part.message_id = message.id
+        WHERE message.data LIKE '%"role":"user"%' AND message.time_created IS NULL
+        ORDER BY message.time_created DESC, message.rowid DESC, part.rowid DESC LIMIT ?`,
+      nullTimePageSql: `SELECT part.data AS partData, message.time_created AS sortTime,
+          message.rowid AS messageRowId, part.rowid AS partRowId FROM message
+        JOIN part ON part.message_id = message.id
+        WHERE message.data LIKE '%"role":"user"%' AND message.time_created IS NULL AND
+          (message.rowid, part.rowid) < (?, ?)
+        ORDER BY message.time_created DESC, message.rowid DESC, part.rowid DESC LIMIT ?`,
+      column: "partData",
+      extract: extractTextFromLegacyPartData,
+      hasPartRowId: true,
+    },
+  ]
+  let successfulSources = 0
+  let lastSourceError: unknown
+  for (const source of sources) {
+    if (seenTexts.size >= maxEntries) break
+    const retainedCountBeforeSource = retainedTexts.length
+    const preparedStatements: SqliteStatementAdapter[] = []
+    try {
+      const prepareTracked = (sql: string): SqliteStatementAdapter => {
+        const statement = database.prepare(sql)
+        preparedStatements.push(statement)
+        return statement
+      }
+      const firstPage = prepareTracked(source.firstPageSql)
+      const nextPage = prepareTracked(source.nextPageSql)
+      const firstNullPage = prepareTracked(source.firstNullPageSql)
+      const nullTimePage = prepareTracked(source.nullTimePageSql)
+      let cursor: { sortTime: unknown; messageRowId: unknown; partRowId: unknown } | null = null
+      let scanningNullTimes = false
+      // A small output limit must not turn a mostly-rejected 100k-row scan
+      // into tens of thousands of tiny synchronous SQLite calls/yields.
+      const pageSize = 256
+      while (seenTexts.size < maxEntries) {
+        // The first page cannot be expressed as a comparison to a NULL
+        // cursor. Every later page binds the physical last row's full sort
+        // tuple, including rejected rows and NULL-time rows; values never
+        // enter SQL by string interpolation.
+        const rows = scanningNullTimes
+          ? cursor === null
+            ? firstNullPage.all(pageSize)
+            : source.hasPartRowId
+              ? nullTimePage.all(cursor.messageRowId, cursor.partRowId, pageSize)
+              : nullTimePage.all(cursor.messageRowId, pageSize)
+          : cursor === null
+            ? firstPage.all(pageSize)
+            : source.hasPartRowId
+              ? nextPage.all(cursor.sortTime, cursor.messageRowId, cursor.partRowId, pageSize)
+              : nextPage.all(cursor.sortTime, cursor.messageRowId, pageSize)
+        if (rows.length === 0) {
+          if (!scanningNullTimes) { scanningNullTimes = true; cursor = null; await yieldToEventLoop(); continue }
+          break
+        }
+        const lastRow = rows[rows.length - 1]
+        cursor = { sortTime: lastRow["sortTime"], messageRowId: lastRow["messageRowId"], partRowId: lastRow["partRowId"] }
+        for (const row of rows) {
+          const extractedText = source.extract(row[source.column])
+          if (extractedText === null) continue
+          const normalizedText = normalizeLineEndings(extractedText).trim()
+          if (seenTexts.has(normalizedText) || !passesHistoryTextFilter(normalizedText, maxTextLength)) continue
+          seenTexts.add(normalizedText)
+          retainedTexts.push(normalizedText)
+          if (seenTexts.size >= maxEntries) break
+        }
+        if (rows.length < pageSize && !scanningNullTimes) {
+          scanningNullTimes = true
+          cursor = null
+          if (seenTexts.size < maxEntries) await yieldToEventLoop()
+          continue
+        }
+        if (rows.length < pageSize) break
+        if (seenTexts.size < maxEntries) await yieldToEventLoop()
+      }
+      successfulSources += 1
+    } catch (sourceError) {
+      // A failed page must not leave a partial source ahead of the next source.
+      for (const text of retainedTexts.splice(retainedCountBeforeSource)) seenTexts.delete(text)
+      lastSourceError = sourceError
+      // A missing/unsupported source does not hide results from the other source.
+    } finally {
+      for (const statement of preparedStatements) {
+        try { statement.finalize?.() } catch { /* Database.close remains best effort. */ }
+      }
+    }
   }
-  return userTexts
+  if (successfulSources === 0) throw lastSourceError
+  return retainedTexts
 }
 
 function extractTextFromSessionMessageData(rawColumnValue: unknown): string | null {
@@ -338,27 +456,6 @@ function extractTextFromSessionMessageData(rawColumnValue: unknown): string | nu
     return messageRecord["text"]
   }
   return null
-}
-
-function readUserTextsFromLegacyMessagePartTables(
-  database: SqliteDatabaseAdapter,
-  rowLimit: number,
-): string[] {
-  const rows = database
-    .prepare(
-      `SELECT part.data AS partData FROM message
-       JOIN part ON part.message_id = message.id
-       WHERE message.data LIKE '%"role":"user"%'
-       ORDER BY message.time_created DESC
-       LIMIT ?`,
-    )
-    .all(rowLimit)
-  const userTexts: string[] = []
-  for (const row of rows) {
-    const partText = extractTextFromLegacyPartData(row["partData"])
-    if (partText !== null) userTexts.push(partText)
-  }
-  return userTexts
 }
 
 function extractTextFromLegacyPartData(rawColumnValue: unknown): string | null {
