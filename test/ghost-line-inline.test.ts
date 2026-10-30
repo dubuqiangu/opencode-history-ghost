@@ -345,6 +345,23 @@ function runCellOffsetPlanCases(): void {
   }
   const asciiPlan = planInlineRender(asciiStore, { currentEditor: () => asciiEditor as unknown as any })
   assertEqual("ASCII 控制组：后缀正确", asciiPlan?.text, "lo there")
+
+  // B1 回归：logicalCursor 与权威前缀不一致（滚动/换行边界）时，位置必须跟随
+  // 前缀而非 logicalCursor，否则会在错误的格子上画另一段尾巴，或直接判 null。
+  const mismatchedCaretEditor = { ...cjkEditor, logicalCursor: { row: 0, col: 99 } }
+  const mismatchedPlan = planInlineRender(cjkStore, { currentEditor: () => mismatchedCaretEditor as unknown as any })
+  assertEqual("logicalCursor 与真实前缀不一致时按前缀定位 x", mismatchedPlan?.x, 2 + 1 + 6)
+
+  // B2 回归：真机 composer 会软换行，光标应取 visualCursor（视口相对，已含换行与滚动），
+  // 必须优先于文档绝对的 logicalCursor，否则长行上会定位到错误的可见行。
+  const wrappedEditor = {
+    ...cjkEditor,
+    logicalCursor: { row: 5, col: 60 },
+    visualCursor: { visualRow: 1, visualCol: 6 },
+  }
+  const wrappedPlan = planInlineRender(cjkStore, { currentEditor: () => wrappedEditor as unknown as any })
+  assertEqual("软换行按 visualCursor 定位 x", wrappedPlan?.x, 2 + 1 + 6)
+  assertEqual("软换行按 visualCursor 定位 y", wrappedPlan?.y, 4 + 1 + 1)
 }
 
 async function main(): Promise<void> {

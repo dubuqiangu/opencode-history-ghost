@@ -27,8 +27,19 @@ export interface TextareaGeometrySource {
   readonly scrollY?: number
   /** Logical caret from the native buffer (row/col in cells, offset in cells). */
   readonly logicalCursor?: { row?: number; col?: number; offset?: number }
+  /**
+   * VIEWPORT-RELATIVE caret (row/col in cells, wrap and scroll already applied).
+   * Preferred over `logicalCursor − scroll`: the composer soft-wraps, so a
+   * document-absolute logical row can name the wrong VISIBLE cell on a long
+   * line. Present on every real EditBufferRenderable.
+   */
+  readonly visualCursor?: { visualRow?: number; visualCol?: number }
   readonly editBuffer?: { measureText?(text: string): number }
-  /** Horizontal scroll of the text buffer, in cells. */
+  /**
+   * Legacy horizontal-scroll probe. The real editor does NOT expose this
+   * (`EditBufferRenderable` exposes `editorView`), so it is only consulted on
+   * the no-visualCursor fallback path and is expected to be absent.
+   */
   readonly textBufferView?: { scrollX?: number }
   getPadding?(edge: number): { unit: number; value: number } | undefined
   readonly isDestroyed?: boolean
@@ -195,18 +206,40 @@ export function resolveOverlayGeometry(
   if (paddingLeftCells === null || paddingTopCells === null) return null
   if (!Number.isSafeInteger(caretCell.row) || caretCell.row < 0) return null
   if (!isFiniteNumber(caretCell.col) || caretCell.col < 0) return null
-  // A scroll value the host cannot report as a number means we cannot trust
-  // the caret's on-screen position at all.
-  if (editor.scrollY !== undefined && !isFiniteNumber(editor.scrollY)) return null
-  if (editor.textBufferView?.scrollX !== undefined && !isFiniteNumber(editor.textBufferView.scrollX)) return null
-  const scrollRow = Math.max(0, Math.trunc(editor.scrollY ?? 0))
-  const scrollColumn = Math.max(0, Math.trunc(editor.textBufferView?.scrollX ?? 0))
+
+  // Prefer the native VIEWPORT-RELATIVE caret. It already has soft-wrap and
+  // scroll applied, so it names the correct on-screen cell on a long line; the
+  // document-absolute `caretCell − scroll` path goes wrong once the composer
+  // wraps. It also retires the old `textBufferView.scrollX` read, which is
+  // always undefined on the real editor (`editorView` is the real property), so
+  // the horizontal offset was silently 0.
+  const visualCursor = editor.visualCursor
+  const hasVisualCursor =
+    visualCursor !== undefined &&
+    Number.isSafeInteger(visualCursor.visualRow) &&
+    Number.isSafeInteger(visualCursor.visualCol) &&
+    (visualCursor.visualRow as number) >= 0 &&
+    (visualCursor.visualCol as number) >= 0
+  let screenRow: number
+  let screenColumn: number
+  if (hasVisualCursor) {
+    screenRow = visualCursor!.visualRow as number
+    screenColumn = visualCursor!.visualCol as number
+  } else {
+    // Fallback for editors without a visual cursor: document cell minus scroll.
+    // A scroll value the host cannot report as a number means we cannot trust
+    // the caret's on-screen position at all.
+    if (editor.scrollY !== undefined && !isFiniteNumber(editor.scrollY)) return null
+    if (editor.textBufferView?.scrollX !== undefined && !isFiniteNumber(editor.textBufferView.scrollX)) return null
+    screenRow = caretCell.row - Math.max(0, Math.trunc(editor.scrollY ?? 0))
+    screenColumn = caretCell.col - Math.max(0, Math.trunc(editor.textBufferView?.scrollX ?? 0))
+  }
 
   const contentWidthCells = Math.trunc(textareaWidth) - paddingLeftCells - paddingRightCells
   if (contentWidthCells <= 0) return null
 
-  const suffixStartColumn = paddingLeftCells + caretCell.col - scrollColumn
-  const suffixStartRow = paddingTopCells + caretCell.row - scrollRow
+  const suffixStartColumn = paddingLeftCells + screenColumn
+  const suffixStartRow = paddingTopCells + screenRow
   if (suffixStartColumn < 0) return null
   // The suffix must start inside the visible line band, otherwise the caret
   // is scrolled away and covering some other row would be actively wrong.
@@ -218,7 +251,7 @@ export function resolveOverlayGeometry(
   return {
     x: textareaX + suffixStartColumn,
     y: textareaY + suffixStartRow,
-    availableCells: contentWidthCells - caretCell.col + scrollColumn,
+    availableCells: contentWidthCells - screenColumn,
     suffix: inlineSuffix.suffix,
   }
 }

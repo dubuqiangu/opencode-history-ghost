@@ -2371,23 +2371,6 @@ var YOGA_POINT_UNIT = 1;
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
-function isValidCaretOffset(typedText, caretOffset) {
-  return typeof typedText === "string" && Number.isSafeInteger(caretOffset) && caretOffset >= 0 && caretOffset <= typedText.length;
-}
-function resolveCaretCell(editor) {
-  const logicalCursor = editor.logicalCursor;
-  if (logicalCursor && Number.isSafeInteger(logicalCursor.row) && Number.isSafeInteger(logicalCursor.col)) {
-    const row = logicalCursor.row;
-    const col = logicalCursor.col;
-    if (row >= 0 && col >= 0) return { row, col };
-  }
-  const typedText = editor.plainText;
-  const caretOffset = editor.cursorOffset;
-  if (!isValidCaretOffset(typedText ?? "", caretOffset)) return null;
-  const textBeforeCaret = typedText.slice(0, caretOffset);
-  const typedLinePrefix = textBeforeCaret.slice(textBeforeCaret.lastIndexOf("\n") + 1);
-  return { row: textBeforeCaret.split("\n").length - 1, col: stringWidth(typedLinePrefix) };
-}
 function computeInlineSuffixFromPrefix(textBeforeCaret, candidateText) {
   if (typeof candidateText !== "string" || candidateText.length === 0) return null;
   if (typeof textBeforeCaret !== "string") return null;
@@ -2425,21 +2408,30 @@ function resolveOverlayGeometry(editor, inlineSuffix, caretCell) {
   if (paddingLeftCells === null || paddingTopCells === null) return null;
   if (!Number.isSafeInteger(caretCell.row) || caretCell.row < 0) return null;
   if (!isFiniteNumber(caretCell.col) || caretCell.col < 0) return null;
-  if (editor.scrollY !== void 0 && !isFiniteNumber(editor.scrollY)) return null;
-  if (editor.textBufferView?.scrollX !== void 0 && !isFiniteNumber(editor.textBufferView.scrollX)) return null;
-  const scrollRow = Math.max(0, Math.trunc(editor.scrollY ?? 0));
-  const scrollColumn = Math.max(0, Math.trunc(editor.textBufferView?.scrollX ?? 0));
+  const visualCursor = editor.visualCursor;
+  const hasVisualCursor = visualCursor !== void 0 && Number.isSafeInteger(visualCursor.visualRow) && Number.isSafeInteger(visualCursor.visualCol) && visualCursor.visualRow >= 0 && visualCursor.visualCol >= 0;
+  let screenRow;
+  let screenColumn;
+  if (hasVisualCursor) {
+    screenRow = visualCursor.visualRow;
+    screenColumn = visualCursor.visualCol;
+  } else {
+    if (editor.scrollY !== void 0 && !isFiniteNumber(editor.scrollY)) return null;
+    if (editor.textBufferView?.scrollX !== void 0 && !isFiniteNumber(editor.textBufferView.scrollX)) return null;
+    screenRow = caretCell.row - Math.max(0, Math.trunc(editor.scrollY ?? 0));
+    screenColumn = caretCell.col - Math.max(0, Math.trunc(editor.textBufferView?.scrollX ?? 0));
+  }
   const contentWidthCells = Math.trunc(textareaWidth) - paddingLeftCells - paddingRightCells;
   if (contentWidthCells <= 0) return null;
-  const suffixStartColumn = paddingLeftCells + caretCell.col - scrollColumn;
-  const suffixStartRow = paddingTopCells + caretCell.row - scrollRow;
+  const suffixStartColumn = paddingLeftCells + screenColumn;
+  const suffixStartRow = paddingTopCells + screenRow;
   if (suffixStartColumn < 0) return null;
   const contentHeightCells = numericLayoutValue(editor.height);
   if (contentHeightCells === null || suffixStartRow < 0 || suffixStartRow >= contentHeightCells) return null;
   return {
     x: textareaX + suffixStartColumn,
     y: textareaY + suffixStartRow,
-    availableCells: contentWidthCells - caretCell.col + scrollColumn,
+    availableCells: contentWidthCells - screenColumn,
     suffix: inlineSuffix.suffix
   };
 }
@@ -2494,7 +2486,7 @@ function planInlineRender(store, editorSource) {
   if (typeof editor.plainText !== "string" || editor.plainText.length === 0) return null;
   const textBeforeCaret = resolveCaretPrefixText(editor);
   if (textBeforeCaret === null) return null;
-  const caretCell = resolveCaretCell(editor) ?? caretCellFromPrefix(textBeforeCaret);
+  const caretCell = caretCellFromPrefix(textBeforeCaret);
   const inlineSuffix = computeInlineSuffixFromPrefix(textBeforeCaret, candidate.text);
   if (!inlineSuffix) return null;
   const geometry = resolveOverlayGeometry(editor, inlineSuffix, caretCell);

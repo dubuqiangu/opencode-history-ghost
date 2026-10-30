@@ -24,7 +24,7 @@
 import type { EditBufferLike } from "./editor-bridge"
 import type { SuggestionStoreApi } from "./suggestion-store"
 import { clampToCellBudget, stringWidth } from "./string-width"
-import { computeInlineSuffixFromPrefix, resolveCaretCell, resolveOverlayGeometry, type CaretCell } from "./ghost-overlay"
+import { computeInlineSuffixFromPrefix, resolveOverlayGeometry, type CaretCell } from "./ghost-overlay"
 
 /** Character kept before the truncation mark when the suffix overflows. */
 const ELLIPSIS = "…"
@@ -138,9 +138,11 @@ export function planInlineRender(
   if (typeof editor.plainText !== "string" || editor.plainText.length === 0) return null
   const textBeforeCaret = resolveCaretPrefixText(editor)
   if (textBeforeCaret === null) return null
-  // Prefer the host's own caret cell; fall back to one derived from the same
-  // authoritative prefix so a missing `logicalCursor` never hides the overlay.
-  const caretCell = resolveCaretCell(editor) ?? caretCellFromPrefix(textBeforeCaret)
+  // Suffix TEXT and suffix POSITION come from the SAME source: the authoritative
+  // caret prefix. `logicalCursor` is a different field from the `cursorOffset`
+  // used to recover the text, so on a scroll/wrap boundary they can disagree —
+  // the old code then painted the tail of one substring at the other's cell.
+  const caretCell = caretCellFromPrefix(textBeforeCaret)
   const inlineSuffix = computeInlineSuffixFromPrefix(textBeforeCaret, candidate.text)
   if (!inlineSuffix) return null
   const geometry = resolveOverlayGeometry(editor, inlineSuffix, caretCell)
