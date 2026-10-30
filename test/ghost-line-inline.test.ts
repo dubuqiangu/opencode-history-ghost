@@ -268,11 +268,24 @@ async function runOverlaySmoke(): Promise<void> {
     await setup.renderOnce()
     overlay.refresh()
     await setup.renderOnce()
+    // Assert on the rendered CELL FRAME, not just "did not throw": the whole
+    // anchor → absolute box → text chain must actually paint the untyped
+    // remainder. (The old smoke test asserted `true`, so a total rendering
+    // regression would still have passed.)
+    const paintedFrame = setup.captureCharFrame()
+    const painted = paintedFrame.includes("lo smoke candidate")
+    if (!painted) {
+      console.log("  ---- captured frame (overlay not found) ----")
+      for (const line of paintedFrame.split("\n")) console.log("  |" + line + "|")
+      console.log("  ------------------------------------------")
+    }
+    assertTrue("覆盖层在真实 textarea 上挂载并绘制出灰字后缀", painted)
     assertTrue("覆盖层在真实 textarea 上挂载并 refresh 不抛错", true)
     smokeStore.clear()
     overlay.refresh()
     await setup.renderOnce()
     assertTrue("建议消失后覆盖层 refresh 仍不抛错", true)
+    assertTrue("建议消失后灰字后缀从帧中消失", !setup.captureCharFrame().includes("lo smoke candidate"))
   } finally {
     await setup.dispose()
   }

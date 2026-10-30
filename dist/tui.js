@@ -2602,7 +2602,8 @@ function createInlineGhostOverlay(deps) {
     },
     refresh() {
       for (const overlay of [...mountedOverlays]) {
-        if (overlay.suffixText?.isDestroyed === true) {
+        const capturedAnyRenderable = overlay.suffixText !== null || overlay.positionBox !== null || overlay.anchorBox !== null;
+        if (overlay.suffixText?.isDestroyed === true || overlay.positionBox?.isDestroyed === true || overlay.anchorBox?.isDestroyed === true || !capturedAnyRenderable) {
           mountedOverlays.delete(overlay);
           continue;
         }

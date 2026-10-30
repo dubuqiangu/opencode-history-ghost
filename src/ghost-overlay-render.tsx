@@ -309,9 +309,19 @@ export function createInlineGhostOverlay(deps: InlineGhostOverlayDeps): InlineGh
     },
     refresh(): void {
       for (const overlay of [...mountedOverlays]) {
-        if (overlay.suffixText?.isDestroyed === true) {
-          // A re-mounted slot leaves a destroyed tree behind; drop it here so
-          // the set cannot grow without bound across host re-renders.
+        // Drop tree(s) the host re-mounted away. A re-mounted slot leaves a
+        // DESTROYED tree behind; an overlay whose slot render never ran captured
+        // nothing and can never be patched again. Pruning both keeps the set
+        // from growing across host re-renders (refs fire synchronously inside
+        // renderOverlay(), so a live overlay is always already captured here).
+        const capturedAnyRenderable =
+          overlay.suffixText !== null || overlay.positionBox !== null || overlay.anchorBox !== null
+        if (
+          overlay.suffixText?.isDestroyed === true ||
+          overlay.positionBox?.isDestroyed === true ||
+          overlay.anchorBox?.isDestroyed === true ||
+          !capturedAnyRenderable
+        ) {
           mountedOverlays.delete(overlay)
           continue
         }
