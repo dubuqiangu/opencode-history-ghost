@@ -55,16 +55,18 @@ async function realRendererScenarios(): Promise<void> {
     runIntegrityPollOnce(bridge)
     stopKeymap = registerKeymap(context, { bridge, store, settings, onToggle: () => { toggleCalls.count += 1 } })
     type CapturedLayer = {
-      target?: () => unknown
-      enabled?: () => boolean
       commands: Array<{ id: string; palette?: boolean; run: () => unknown }>
     }
     const registeredLayers = capturedLayers.map((factory) => factory() as CapturedLayer)
     const layer = registeredLayers.find((registeredLayer) => registeredLayer.commands.some((command) => command.id === "history-ghost.accept"))!
     const paletteLayer = registeredLayers.find((registeredLayer) => registeredLayer.commands.some((command) => command.id === "history-ghost.toggle"))!
-    const suggestionTarget = () => layer?.target?.()
-    const suggestionEnabled = () => layer?.enabled?.() === true
-    const paletteReachable = () => paletteLayer && paletteLayer.enabled?.() !== false && (paletteLayer.target === undefined || paletteLayer.target() !== null)
+    // Shortcuts are gated inside run(), not by a static layer `target`/`enabled`:
+    // the host resolves `target` once and REMOVES the layer when it yields null,
+    // which killed every key on the real machine. "Target" now maps to the live
+    // proven-editor check, and the layer must simply stay registered.
+    const suggestionTarget = () => bridge.current()
+    const suggestionLayerPresent = () => layer !== undefined
+    const paletteReachable = () => paletteLayer !== undefined
     const accept = layer.commands.find((command) => command.id === "history-ghost.accept")!
     const dismiss = layer.commands.find((command) => command.id === "history-ghost.dismiss")!
     const next = layer.commands.find((command) => command.id === "history-ghost.cycle-next")!
@@ -72,10 +74,11 @@ async function realRendererScenarios(): Promise<void> {
     const toggle = paletteLayer?.commands.find((command) => command.id === "history-ghost.toggle")
 
     check("toggle registered separately from suggestion-only commands", registeredLayers.length >= 2 && layer !== paletteLayer && !layer.commands.some((command) => command.id === "history-ghost.toggle") && paletteLayer?.commands.every((command) => command.id === "history-ghost.toggle"))
-    // The layer stays reachable with no suggestion: gating `enabled` on store
-    // state froze it at its first value and Tab never dispatched (production
-    // bug). The suggestion condition lives in run(), which yields the key.
-    check("suggestion layer reachable without suggestion", suggestionEnabled())
+    // The layer stays REGISTERED with no suggestion: a static `target`/`enabled`
+    // gated on store state either froze the layer or (target) got the layer
+    // removed by the host. The suggestion condition lives in run(), which yields
+    // the key. Registration itself must therefore never depend on state.
+    check("suggestion layer reachable without suggestion", suggestionLayerPresent())
     const acceptForward = layer.commands.find((command) => command.id === "history-ghost.accept-forward")!
     check("every shortcut yields the key without a suggestion", [accept, acceptForward, dismiss, next, previous].every((command) => command.run() === false))
     check("palette toggle reachable without suggestion", Boolean(toggle?.palette && paletteReachable()))
@@ -84,14 +87,14 @@ async function realRendererScenarios(): Promise<void> {
 
     composer.insertText("hel")
     await setup.renderOnce()
-    check("composer active and suggestion ready", suggestionTarget() === composer && store.hasSuggestion() && suggestionEnabled())
+    check("composer active and suggestion ready", suggestionTarget() === composer && store.hasSuggestion() && suggestionLayerPresent())
     for (const blockedMode of ["autocomplete", "modal"]) {
       inputMode = blockedMode
-      check(`${blockedMode} disables suggestion keymap without changing focus`, !suggestionEnabled() && suggestionTarget() === composer)
+      check(`${blockedMode} keeps the layer present without changing focus`, suggestionLayerPresent() && suggestionTarget() === composer)
       check(`${blockedMode} Tab/Esc/cycle all yield at dispatch`, [accept, dismiss, next, previous].every((command) => command.run() === false) && store.hasSuggestion() && composer.plainText === "hel")
     }
     inputMode = "normal"
-    check("mode-only return restores suggestion keymap", suggestionEnabled() && suggestionTarget() === composer)
+    check("mode-only return restores suggestion keymap", suggestionLayerPresent() && suggestionTarget() === composer)
     check("palette toggle remains exposed in separate layer", toggle !== undefined && paletteReachable())
 
     dialog.focus()

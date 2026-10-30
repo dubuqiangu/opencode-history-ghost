@@ -278,6 +278,75 @@ async function runOverlaySmoke(): Promise<void> {
   }
 }
 
+// ---------------------------------------------- 6. 真机坐标：cursorOffset 是显示格
+
+/**
+ * 回归：真机 textarea 的 `cursorOffset` 是“显示格”，不是 UTF-16 码元。对 CJK/emoji，
+ * 格数 > 码元数，若按 `plainText.slice(0, cursorOffset)` 切就会越界 → 覆盖层永久隐藏
+ * （用户真机症状：灰色建议只出现在输入框上方）。这里用一个“格偏移 + editBuffer 映射”
+ * 的仿真编辑器锁定新路径必须产出后缀。
+ */
+function sliceByDisplayCells(text: string, startCell: number, endCell: number): string {
+  let cellCursor = 0
+  let sliced = ""
+  for (const character of Array.from(text)) {
+    const characterWidth = stringWidth(character)
+    const nextCell = cellCursor + characterWidth
+    if (nextCell > startCell && cellCursor < endCell) sliced += character
+    cellCursor = nextCell
+    if (cellCursor >= endCell) break
+  }
+  return sliced
+}
+
+function runCellOffsetPlanCases(): void {
+  const cjkHistory = [{ text: "你好世界和平", lower: "你好世界和平" }]
+  const cjkStore = createSuggestionStore(() => cjkHistory, makeTestSettings())
+  cjkStore.evaluate("你好世")
+  const cjkEditor = {
+    plainText: "你好世", // 3 UTF-16 code units
+    cursorOffset: 6, // 6 display cells — the real SDK convention
+    isDestroyed: false,
+    logicalCursor: { row: 0, col: 6 },
+    screenX: 2,
+    screenY: 4,
+    width: 40,
+    height: 3,
+    scrollY: 0,
+    textBufferView: { scrollX: 0 },
+    getPadding: (edge: number) => (edge === 0 || edge === 1 ? { unit: 1, value: 1 } : { unit: 1, value: 0 }),
+    editBuffer: {
+      measureText: (text: string) => stringWidth(text),
+      getTextRange: (startCell: number, endCell: number) => sliceByDisplayCells("你好世", startCell, endCell),
+    },
+  }
+  const cjkPlan = planInlineRender(cjkStore, { currentEditor: () => cjkEditor as unknown as any })
+  assertEqual("格偏移 CJK 前缀产出后缀（修复前为 null）", cjkPlan?.text, "界和平")
+  assertEqual("格偏移 CJK 后缀起点 x", cjkPlan?.x, 2 + 1 + 6)
+
+  // 真机意外缺失 logicalCursor 时，也必须能靠权威前缀推出光标格。
+  const editorWithoutLogicalCursor = { ...cjkEditor, logicalCursor: undefined }
+  const fallbackPlan = planInlineRender(cjkStore, { currentEditor: () => editorWithoutLogicalCursor as unknown as any })
+  assertEqual("缺 logicalCursor 仍由前缀推出光标格", fallbackPlan?.text, "界和平")
+
+  // ASCII 控制组：格 == 码元，新旧坐标一致。
+  const asciiHistory = [{ text: "hello there", lower: "hello there" }]
+  const asciiStore = createSuggestionStore(() => asciiHistory, makeTestSettings())
+  asciiStore.evaluate("hel")
+  const asciiEditor = {
+    ...cjkEditor,
+    plainText: "hel",
+    cursorOffset: 3,
+    logicalCursor: { row: 0, col: 3 },
+    editBuffer: {
+      measureText: (text: string) => stringWidth(text),
+      getTextRange: (startCell: number, endCell: number) => sliceByDisplayCells("hel", startCell, endCell),
+    },
+  }
+  const asciiPlan = planInlineRender(asciiStore, { currentEditor: () => asciiEditor as unknown as any })
+  assertEqual("ASCII 控制组：后缀正确", asciiPlan?.text, "lo there")
+}
+
 async function main(): Promise<void> {
   console.log("[1] 后缀切分：前缀 / 子串 / 多行 / CJK / emoji")
   runSuffixSplittingCases()
@@ -289,6 +358,8 @@ async function main(): Promise<void> {
   await runGhostRowRegression()
   console.log("[5] 覆盖层挂载冒烟（真实 textarea）")
   await runOverlaySmoke()
+  console.log("[6] 真机坐标：cursorOffset 显示格 + editBuffer 映射（CJK 覆盖层可见性）")
+  runCellOffsetPlanCases()
   console.log("----")
   if (failedAssertionCount === 0) {
     console.log("测试结论：全部 PASS")

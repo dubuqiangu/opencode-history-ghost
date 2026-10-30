@@ -4,13 +4,10 @@
 // can be pointed at the surface that actually exists in this host version,
 // instead of guessing at `context.ui.slot` / `context.ui.keymap`.
 import * as fs from "node:fs"
-import * as nodePath from "node:path"
+import { probeFilePath } from "./probe-log"
 
-/** Absolute path of the shape dump — outside the bundle, for manual reading. */
-const PROBE_FILE = nodePath.join(
-  "D:\\workSpace\\python\\aicode\\opencode\\opencode-history-ghost",
-  "probe-context-shape.txt",
-)
+/** Repo-root path of the shape dump — outside the bundle, for manual reading. */
+const PROBE_FILE = probeFilePath("probe-context-shape.txt")
 
 function describeValue(value: unknown): string {
   if (value === null) return "null";

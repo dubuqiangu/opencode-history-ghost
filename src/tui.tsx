@@ -32,7 +32,7 @@ import { createGhostLine } from "./ghost-line"
 import { registerKeymap } from "./keymap"
 
 import { probeContextShape } from "./context-probe"
-import { recordEvent, recordFailure } from "./probe-log"
+import { recordEvent, recordFailure, probeFilePath } from "./probe-log"
 
 /** History-source refresh cadence (jsonl mtime poll, DESIGN §2). */
 const HISTORY_REFRESH_INTERVAL_MS = 3000
@@ -74,7 +74,7 @@ export default Plugin.define({
     try {
       const runtimeRole = context?.ui?.slot ? "client" : "server"
       fs.appendFileSync(
-        "D:\\workSpace\\python\\aicode\\opencode\\opencode-history-ghost\\probe-runtime-role.txt",
+        probeFilePath("probe-runtime-role.txt"),
         `${new Date().toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} role=${runtimeRole} bootstrap=${Object.prototype.hasOwnProperty.call(context, "bootstrap")} ui=${typeof context?.ui}\n`,
       )
     } catch {}
@@ -262,10 +262,13 @@ export default Plugin.define({
             })
             if (registration.suggestionLayerRegistered) keymapCleanup = registration
           }
-          // The inline grey suffix is a static absolutely-positioned node on
-          // the app slot; mounting it here keeps the whole suggestion surface
-          // on one slot and lets the bridge be the single trust gate.
-          return ghostLine.renderInlineOverlay()
+          // Headless: the app slot is only the keymap provider anchor. Its own
+          // render must return null — `append: "app"` lays out in NORMAL flow at
+          // the bottom of the main column, so an absolutely-positioned overlay
+          // mounted here anchors against the wrong container and lands
+          // off-screen. The inline suffix is claimed on the composer region
+          // instead (see the overlay slot below).
+          return null
         },
       })
       if (typeof appSlotResult?.dispose === "function") stopAppSlot = appSlotResult.dispose
@@ -288,6 +291,26 @@ export default Plugin.define({
     } catch (error) {
       recordFailure("slot.session.composer.top", error)
       console.warn("[opencode-history-ghost] composer slot registration failed:", error)
+    }
+
+    // ---- Composer-region overlay: the untyped grey suffix drawn over the
+    // composer itself (方案 B). It MUST be claimed in the composer region, not
+    // `app`: the app slot lays out in normal flow at the bottom of the main
+    // column, so an absolute child there resolves against the wrong container
+    // and never covers the input. The overlay is a zero-size anchor box whose
+    // absolutely-positioned suffix child is offset relative to the anchor
+    // (proven technique: JosXa/opencode-snippets).
+    let stopOverlaySlot: (() => void) | undefined
+    try {
+      const slotResult = context.ui?.slot?.({
+        append: "session.composer.top",
+        render: () => ghostLine.renderInlineOverlay(),
+      })
+      if (typeof slotResult?.dispose === "function") stopOverlaySlot = slotResult.dispose
+      else if (typeof slotResult === "function") stopOverlaySlot = slotResult
+    } catch (error) {
+      recordFailure("slot.overlay", error)
+      console.warn("[opencode-history-ghost] composer overlay slot registration failed:", error)
     }
 
     // ---- History refresh: jsonl mtime poll covers prompts that were just
@@ -318,6 +341,7 @@ export default Plugin.define({
       keymapCleanup?.()
       stopAppSlot?.()
       stopComposerSlot?.()
+      stopOverlaySlot?.()
       stopIdentitySlot?.()
     }
 

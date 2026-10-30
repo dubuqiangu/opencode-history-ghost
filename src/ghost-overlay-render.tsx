@@ -2,15 +2,19 @@
 // Renders the inline ghost suffix over the composer (方案 B: absolute 覆盖层).
 //
 // This file owns exactly one line of one renderable: a static `text` node
-// pinned with position:absolute on the renderer root. refresh() recomputes the
-// caret cell and the suffix text and writes them onto that node; it never
-// creates, destroys or re-mounts anything, so the host's reconciler never sees
-// us churn and layout cost stays at one node.
+// nested inside a zero-size anchor box claimed on the composer region, with
+// position:absolute on the inner box. refresh() recomputes the caret cell and
+// the suffix text and writes them onto that node; it never creates, destroys or
+// re-mounts anything, so the host's reconciler never sees us churn and layout
+// cost stays at one node.
 //
-// Why the renderer root: the textarea lives under the session slot tree and we
-// cannot add a child to it. screenX/screenY are absolute screen cells, so
-// pinning our node to the root (origin = screen cell 0,0) needs no
-// ancestor-local arithmetic.
+// Why a composer-region anchor: the textarea lives under the session slot tree
+// and we cannot add a child to it. A slot render returns one JSX element, so
+// the root is an IN-FLOW zero-size box; its screen origin IS the composer
+// region's origin, and the absolutely-positioned suffix child is inset relative
+// to it. (The old app-slot approach anchored an absolute node to the app
+// container, which lays out in normal flow at the bottom of the main column —
+// so the suffix landed off-screen.)
 //
 // Degradation contract: planInlineRender() returns null whenever the editor
 // instance, its geometry or the store state is unusable. The overlay then sets
@@ -19,8 +23,8 @@
 
 import type { EditBufferLike } from "./editor-bridge"
 import type { SuggestionStoreApi } from "./suggestion-store"
-import { clampToCellBudget } from "./string-width"
-import { computeInlineSuffix, resolveCaretCell, resolveOverlayGeometry } from "./ghost-overlay"
+import { clampToCellBudget, stringWidth } from "./string-width"
+import { computeInlineSuffixFromPrefix, resolveCaretCell, resolveOverlayGeometry, type CaretCell } from "./ghost-overlay"
 
 /** Character kept before the truncation mark when the suffix overflows. */
 const ELLIPSIS = "…"
@@ -71,6 +75,52 @@ export function fitSuffixToWidth(suffix: string, availableCells: number): string
 }
 
 /**
+ * The authoritative text left of the caret. The SDK's `cursorOffset` counts
+ * DISPLAY CELLS: for CJK/emoji it exceeds the UTF-16 code-unit length, so
+ * `plainText.slice(0, cursorOffset)` is wrong and no arithmetic recovers the
+ * boundary. The native buffer converts cells → real text; fake editors without
+ * a buffer keep their code-unit convention. Null when neither can be trusted
+ * (the overlay then stays hidden and the row above carries the suggestion).
+ */
+function resolveCaretPrefixText(editor: EditBufferLike & Record<string, unknown>): string | null {
+  const offset = editor.cursorOffset
+  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) return null
+  const buffer = editor.editBuffer
+  if (buffer && typeof buffer.getTextRange === "function" && typeof buffer.measureText === "function") {
+    try {
+      const text = editor.plainText
+      if (typeof text !== "string") return null
+      const end = buffer.measureText(text)
+      if (offset > end) return null
+      const prefix = buffer.getTextRange(0, offset)
+      // Mirror the bridge's invariant: the split must be lossless.
+      if (prefix + buffer.getTextRange(offset, end) !== text) return null
+      return prefix
+    } catch {
+      // A host that refuses these reads leaves the prefix unknown → hidden.
+      return null
+    }
+  }
+  const plainText = editor.plainText
+  if (typeof plainText === "string" && offset <= plainText.length) return plainText.slice(0, offset)
+  return null
+}
+
+/**
+ * Caret line/column derived from the authoritative prefix string. Used only
+ * when the editor reports no `logicalCursor`: without it, a cell-valued
+ * `cursorOffset` on a CJK editor had no valid cell and the overlay stayed
+ * hidden. `stringWidth` restores the display-cell column.
+ */
+function caretCellFromPrefix(textBeforeCaret: string): CaretCell {
+  const lastNewlineIndex = textBeforeCaret.lastIndexOf("\n")
+  return {
+    row: textBeforeCaret.split("\n").length - 1,
+    col: stringWidth(textBeforeCaret.slice(lastNewlineIndex + 1)),
+  }
+}
+
+/**
  * Decides what the overlay should show for one tick. Returns null for "hide":
  * no suggestion, no proven editor, unusable geometry, or an empty suffix.
  * Every caller treats null the same way, and nothing here throws.
@@ -86,9 +136,12 @@ export function planInlineRender(
   const editor = editorSource.currentEditor()
   if (!editor || editor.isDestroyed === true) return null
   if (typeof editor.plainText !== "string" || editor.plainText.length === 0) return null
-  const caretCell = resolveCaretCell(editor)
-  if (!caretCell) return null
-  const inlineSuffix = computeInlineSuffix(editor.plainText, editor.cursorOffset, candidate.text)
+  const textBeforeCaret = resolveCaretPrefixText(editor)
+  if (textBeforeCaret === null) return null
+  // Prefer the host's own caret cell; fall back to one derived from the same
+  // authoritative prefix so a missing `logicalCursor` never hides the overlay.
+  const caretCell = resolveCaretCell(editor) ?? caretCellFromPrefix(textBeforeCaret)
+  const inlineSuffix = computeInlineSuffixFromPrefix(textBeforeCaret, candidate.text)
   if (!inlineSuffix) return null
   const geometry = resolveOverlayGeometry(editor, inlineSuffix, caretCell)
   if (!geometry) return null
@@ -131,8 +184,6 @@ export function createInlineGhostOverlay(deps: InlineGhostOverlayDeps): InlineGh
     originRow: number | null
   }
   const mountedOverlays = new Set<MountedOverlay>()
-  /** Most recently mounted overlay for this slot; dropped on the next remount. */
-  let lastOverlay: MountedOverlay | null = null
 
   /**
    * Re-reads the slot container's screen origin from the self-owned zero-size
@@ -207,7 +258,6 @@ export function createInlineGhostOverlay(deps: InlineGhostOverlayDeps): InlineGh
 
   return {
     renderOverlay(): unknown {
-      if (lastOverlay) mountedOverlays.delete(lastOverlay)
       const mountedOverlay: MountedOverlay = {
         suffixText: null,
         positionBox: null,
@@ -215,42 +265,56 @@ export function createInlineGhostOverlay(deps: InlineGhostOverlayDeps): InlineGh
         originColumn: null,
         originRow: null,
       }
-      lastOverlay = mountedOverlay
       mountedOverlays.add(mountedOverlay)
-      return [
-        // Zero-size anchor: its screen origin IS the slot container's origin.
+      // Single-root, IN-FLOW zero-size anchor (proven: JosXa/opencode-snippets).
+      // A slot render may return one JSX element; the anchor itself occupies no
+      // cells in the composer region, and its screen origin IS that region's
+      // origin. The suffix lives in a NESTED absolutely-positioned child, so its
+      // left/top are inset relative to the anchor — no screen-cell arithmetic
+      // against a foreign container, and no dependency on the app slot's flow
+      // position (the old bug: two absolute siblings anchored to the wrong
+      // container and landed off-screen).
+      return (
         <box
-          position="absolute"
-          left={0}
-          top={0}
           width={0}
           height={0}
-          zIndex={1}
+          focusable={false}
           ref={(anchorRenderable: unknown) => {
             mountedOverlay.anchorBox = (anchorRenderable as PositionedBoxRenderable | null) ?? null
             patchOverlay(mountedOverlay)
           }}
-        />,
-        <box
-          position="absolute"
-          zIndex={1000}
-          ref={(positionRenderable: unknown) => {
-            mountedOverlay.positionBox = (positionRenderable as PositionedBoxRenderable | null) ?? null
-            patchOverlay(mountedOverlay)
-          }}
         >
-          <text
-            fg={mutedColor}
-            ref={(textRenderable: unknown) => {
-              mountedOverlay.suffixText = (textRenderable as OverlayTextRenderable | null) ?? null
+          <box
+            position="absolute"
+            left={0}
+            top={0}
+            zIndex={1000}
+            ref={(positionRenderable: unknown) => {
+              mountedOverlay.positionBox = (positionRenderable as PositionedBoxRenderable | null) ?? null
               patchOverlay(mountedOverlay)
             }}
-          />
-        </box>,
-      ]
+          >
+            <text
+              fg={mutedColor}
+              ref={(textRenderable: unknown) => {
+                mountedOverlay.suffixText = (textRenderable as OverlayTextRenderable | null) ?? null
+                patchOverlay(mountedOverlay)
+              }}
+            />
+          </box>
+        </box>
+      )
     },
     refresh(): void {
-      for (const overlay of mountedOverlays) patchOverlay(overlay)
+      for (const overlay of [...mountedOverlays]) {
+        if (overlay.suffixText?.isDestroyed === true) {
+          // A re-mounted slot leaves a destroyed tree behind; drop it here so
+          // the set cannot grow without bound across host re-renders.
+          mountedOverlays.delete(overlay)
+          continue
+        }
+        patchOverlay(overlay)
+      }
     },
   }
 }

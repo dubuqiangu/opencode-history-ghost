@@ -64,9 +64,14 @@ try {
   composer.focus()
   runIntegrityPollOnce(bridge)
   stopKeymap = registerKeymap(context, { bridge, store, settings, onToggle: () => {} })
-  const layer = layerFactories.map((factory) => factory() as { enabled(): boolean; commands: Array<{ id: string; run(): unknown }> })
+  const layer = layerFactories.map((factory) => factory() as { target?: unknown; enabled?: unknown; commands: Array<{ id: string; run(): unknown }> })
     .find((registeredLayer) => registeredLayer.commands.some((command) => command.id === "history-ghost.accept"))!
   const accept = layer.commands.find((command) => command.id === "history-ghost.accept")!
+  // Regression guard for the real-machine root cause: a layer that declares a
+  // `target` thunk is resolved ONCE by the host, and the layer is REMOVED when
+  // that call yields null (composer not yet proven) — every shortcut then dies.
+  // The suggestion layer must therefore declare neither `target` nor `enabled`.
+  check("suggestion layer declares no static target/enabled", layer.target === undefined && layer.enabled === undefined)
   async function setCaretBeforeSuffix(text: string, suffix: string): Promise<void> {
     composer.replaceText("")
     composer.insertText(text)
@@ -119,9 +124,9 @@ try {
   runIntegrityPollOnce(bridge)
   await setCaretBeforeSuffix("abcXYZ", "XYZ")
   inputMode = "autocomplete"
-  check("host autocomplete owns Tab", !layer.enabled() && accept.run() === false && composer.plainText === "abcXYZ")
+  check("host autocomplete owns Tab", accept.run() === false && composer.plainText === "abcXYZ")
   inputMode = "modal"
-  check("host modal owns Tab", !layer.enabled() && accept.run() === false && composer.plainText === "abcXYZ")
+  check("host modal owns Tab", accept.run() === false && composer.plainText === "abcXYZ")
   inputMode = "normal"
   foreignEditor.focus()
   check("foreign editor with same input cannot be replaced", accept.run() === false && composer.plainText === "abcXYZ")

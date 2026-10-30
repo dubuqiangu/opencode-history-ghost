@@ -134,14 +134,15 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): KeymapRegist
   try {
     const layerResult = keymap.layer(() => ({
       mode: "global",
-      // Only dispatch while the composer textarea itself has focus.
-      target: () => deps.bridge.current(),
-      // Deliberately independent of store state: the host evaluates `enabled`
-      // reactively, and the store's state is plain mutable data (not a signal),
-      // so a `hasSuggestion()` read here froze the layer at its first value —
-      // false — and the shortcuts never dispatched again. Suggestibility is
-      // re-checked inside each run(), where it costs nothing and is always live.
-      enabled: () => !isHostOverlayMode(keymap),
+      // NO `target` and NO `enabled` here. The host resolves a layer's `target`
+      // thunk to a STATIC reference once, untracked, and REPLACES the layer with
+      // undefined — i.e. removes it — when that call returns null. `target:
+      // () => deps.bridge.current()` is null until the composer is proven, so
+      // the whole layer was deleted at activation and every shortcut died
+      // (real-machine: Tab/right/ctrl+up/ctrl+down all no-ops). This mirrors the
+      // two working same-host plugins (opencode-autocontinue, opencode-snippets),
+      // which declare only `mode: "global"` + `commands` and gate inside run().
+      // All real gating stays in each run() below.
       commands: [
         {
           id: "history-ghost.accept",

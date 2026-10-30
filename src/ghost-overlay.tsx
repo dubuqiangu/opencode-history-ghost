@@ -99,32 +99,57 @@ export function resolveCaretCell(editor: TextareaGeometrySource): CaretCell | nu
 
 /**
  * Splits the candidate into what the user already typed and what is still
- * missing. The store matches on the trimmed caret prefix, so the candidate
- * begins with it; the suffix is everything after that prefix, cut at the first
- * newline because only the caret's line can be covered.
+ * missing, given the AUTHORITATIVE text left of the caret. The store matches on
+ * the trimmed caret prefix, so the candidate begins with it; the suffix is
+ * everything after that prefix, cut at the first newline because only the
+ * caret's line can be covered.
+ *
+ * Takes the caret prefix as a STRING, not a numeric offset, on purpose: the
+ * SDK's `cursorOffset` is a display-CELL value, and for CJK/emoji cells exceed
+ * UTF-16 code units, so `text.slice(0, cursorOffset)` is wrong and no arithmetic
+ * can recover the true boundary. Callers derive the prefix from the buffer
+ * (`editBuffer.getTextRange(0, cursorOffset)`) and pass it here.
  *
  * Returns null when the candidate does not carry the typed prefix (stale state
  * within one tick) — drawing an unrelated tail would be worse than drawing
  * nothing for that frame.
  */
-export function computeInlineSuffix(
-  typedText: string,
-  caretOffset: number,
+export function computeInlineSuffixFromPrefix(
+  textBeforeCaret: string,
   candidateText: string,
 ): InlineSuffix | null {
   if (typeof candidateText !== "string" || candidateText.length === 0) return null
-  if (!isValidCaretOffset(typedText, caretOffset)) return null
-  const textBeforeCaret = typedText.slice(0, caretOffset)
+  if (typeof textBeforeCaret !== "string") return null
   const typedLinePrefix = textBeforeCaret.slice(textBeforeCaret.lastIndexOf("\n") + 1)
   // 匹配器用的是 trim 后的前缀，后缀要从候选里这段前缀之后开始切。
   const trimmedPrefix = textBeforeCaret.trim()
-  if (!candidateText.toLowerCase().startsWith(trimmedPrefix.toLowerCase())) return null
+  // Compare an equal-length HEAD of the candidate instead of lowercasing the
+  // whole string first: `toLowerCase()` can change length (e.g. "İ" → "i̇"), so
+  // a `startsWith` on lowercased strings could pass while a slice by
+  // `trimmedPrefix.length` cut at the wrong UTF-16 offset. Slicing the original
+  // by the prefix length and comparing that exact head keeps the cut aligned.
+  const candidateHead = candidateText.slice(0, trimmedPrefix.length)
+  if (candidateHead.toLowerCase() !== trimmedPrefix.toLowerCase()) return null
   const remainder = candidateText.slice(trimmedPrefix.length)
   if (remainder.length === 0) return null
   const newlineIndex = remainder.indexOf("\n")
   const suffix = newlineIndex === -1 ? remainder : remainder.slice(0, newlineIndex)
   if (suffix.length === 0) return null
   return { suffix, typedLinePrefix, continuesOnNextLine: newlineIndex !== -1 }
+}
+
+/**
+ * Code-unit convenience wrapper for FAKE editors whose `cursorOffset` counts
+ * UTF-16 units (never the real SDK, where it counts display cells — use
+ * `computeInlineSuffixFromPrefix` with a buffer-derived prefix there).
+ */
+export function computeInlineSuffix(
+  typedText: string,
+  caretOffset: number,
+  candidateText: string,
+): InlineSuffix | null {
+  if (!isValidCaretOffset(typedText, caretOffset)) return null
+  return computeInlineSuffixFromPrefix(typedText.slice(0, caretOffset), candidateText)
 }
 
 /** Padding of one edge in whole cells; null when the host does not expose it. */

@@ -158,11 +158,23 @@ export function createSuggestionStore(
             !historyChanged &&
             shownCandidate &&
             inputOnlyExtended &&
-            shownCandidate.lower.startsWith(trimmedInput.toLowerCase()) &&
+            previousState.candidates.length < settings.maxCandidates &&
+            previousState.candidates.every((previousCandidate) =>
+              previousCandidate.lower.startsWith(trimmedInput.toLowerCase()),
+            ) &&
             shownCandidate.text !== trimmedInput
           ) {
-            // Fast path: the typed text still prefixes the shown candidate —
-            // keep list and index, only move `input` (anti-flicker).
+            // Fast path (anti-flicker): keep the candidate array reference and
+            // the cycled index, only advance `input`. Two guards keep it sound:
+            //   • EVERY candidate in the previous list must still prefix-match
+            //     the longer input. The old check only inspected the *shown*
+            //     candidate, so a substring/fuzzy entry for the shorter input
+            //     (e.g. "my help" for "hel") survived "hell" even though it no
+            //     longer qualifies. Requiring all of them fixes that.
+            //   • the list must be untruncated (< maxCandidates). A capped list
+            //     could be missing a prefix entry that only now fits, so we
+            //     recompute instead. Untruncated ⇒ nothing new can appear: a
+            //     prefix of "hell" is always a prefix of "hel".
             commitState({ input: trimmedInput, candidates: previousState.candidates, index: previousState.index })
             return
           }

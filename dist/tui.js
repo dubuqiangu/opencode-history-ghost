@@ -2245,7 +2245,9 @@ function createSuggestionStore(history, settings) {
         if (!historyChanged && previousState.input === trimmedInput) return;
         const shownCandidate = previousState.candidates[previousState.index];
         const inputOnlyExtended = trimmedInput.length > previousState.input.length && trimmedInput.startsWith(previousState.input);
-        if (!historyChanged && shownCandidate && inputOnlyExtended && shownCandidate.lower.startsWith(trimmedInput.toLowerCase()) && shownCandidate.text !== trimmedInput) {
+        if (!historyChanged && shownCandidate && inputOnlyExtended && previousState.candidates.length < settings.maxCandidates && previousState.candidates.every(
+          (previousCandidate) => previousCandidate.lower.startsWith(trimmedInput.toLowerCase())
+        ) && shownCandidate.text !== trimmedInput) {
           commitState({ input: trimmedInput, candidates: previousState.candidates, index: previousState.index });
           return;
         }
@@ -2386,13 +2388,13 @@ function resolveCaretCell(editor) {
   const typedLinePrefix = textBeforeCaret.slice(textBeforeCaret.lastIndexOf("\n") + 1);
   return { row: textBeforeCaret.split("\n").length - 1, col: stringWidth(typedLinePrefix) };
 }
-function computeInlineSuffix(typedText, caretOffset, candidateText) {
+function computeInlineSuffixFromPrefix(textBeforeCaret, candidateText) {
   if (typeof candidateText !== "string" || candidateText.length === 0) return null;
-  if (!isValidCaretOffset(typedText, caretOffset)) return null;
-  const textBeforeCaret = typedText.slice(0, caretOffset);
+  if (typeof textBeforeCaret !== "string") return null;
   const typedLinePrefix = textBeforeCaret.slice(textBeforeCaret.lastIndexOf("\n") + 1);
   const trimmedPrefix = textBeforeCaret.trim();
-  if (!candidateText.toLowerCase().startsWith(trimmedPrefix.toLowerCase())) return null;
+  const candidateHead = candidateText.slice(0, trimmedPrefix.length);
+  if (candidateHead.toLowerCase() !== trimmedPrefix.toLowerCase()) return null;
   const remainder = candidateText.slice(trimmedPrefix.length);
   if (remainder.length === 0) return null;
   const newlineIndex = remainder.indexOf("\n");
@@ -2454,6 +2456,34 @@ function fitSuffixToWidth(suffix, availableCells) {
   if (keptWithRoomForEllipsis.length === 0) return "";
   return `${keptWithRoomForEllipsis}${ELLIPSIS}`;
 }
+function resolveCaretPrefixText(editor) {
+  const offset = editor.cursorOffset;
+  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) return null;
+  const buffer = editor.editBuffer;
+  if (buffer && typeof buffer.getTextRange === "function" && typeof buffer.measureText === "function") {
+    try {
+      const text = editor.plainText;
+      if (typeof text !== "string") return null;
+      const end = buffer.measureText(text);
+      if (offset > end) return null;
+      const prefix = buffer.getTextRange(0, offset);
+      if (prefix + buffer.getTextRange(offset, end) !== text) return null;
+      return prefix;
+    } catch {
+      return null;
+    }
+  }
+  const plainText = editor.plainText;
+  if (typeof plainText === "string" && offset <= plainText.length) return plainText.slice(0, offset);
+  return null;
+}
+function caretCellFromPrefix(textBeforeCaret) {
+  const lastNewlineIndex = textBeforeCaret.lastIndexOf("\n");
+  return {
+    row: textBeforeCaret.split("\n").length - 1,
+    col: stringWidth(textBeforeCaret.slice(lastNewlineIndex + 1))
+  };
+}
 function planInlineRender(store, editorSource) {
   if (!editorSource) return null;
   const suggestionState = store.state();
@@ -2462,9 +2492,10 @@ function planInlineRender(store, editorSource) {
   const editor = editorSource.currentEditor();
   if (!editor || editor.isDestroyed === true) return null;
   if (typeof editor.plainText !== "string" || editor.plainText.length === 0) return null;
-  const caretCell = resolveCaretCell(editor);
-  if (!caretCell) return null;
-  const inlineSuffix = computeInlineSuffix(editor.plainText, editor.cursorOffset, candidate.text);
+  const textBeforeCaret = resolveCaretPrefixText(editor);
+  if (textBeforeCaret === null) return null;
+  const caretCell = resolveCaretCell(editor) ?? caretCellFromPrefix(textBeforeCaret);
+  const inlineSuffix = computeInlineSuffixFromPrefix(textBeforeCaret, candidate.text);
   if (!inlineSuffix) return null;
   const geometry = resolveOverlayGeometry(editor, inlineSuffix, caretCell);
   if (!geometry) return null;
@@ -2476,7 +2507,6 @@ function createInlineGhostOverlay(deps) {
   const themeText = deps.theme?.text ?? deps.theme?.colors;
   const mutedColor = themeText?.muted ?? "gray";
   const mountedOverlays = /* @__PURE__ */ new Set();
-  let lastOverlay = null;
   function readContainerOrigin(overlay) {
     const anchorBox = overlay.anchorBox;
     if (!anchorBox) {
@@ -2534,7 +2564,6 @@ function createInlineGhostOverlay(deps) {
   }
   return {
     renderOverlay() {
-      if (lastOverlay) mountedOverlays.delete(lastOverlay);
       const mountedOverlay = {
         suffixText: null,
         positionBox: null,
@@ -2542,50 +2571,51 @@ function createInlineGhostOverlay(deps) {
         originColumn: null,
         originRow: null
       };
-      lastOverlay = mountedOverlay;
       mountedOverlays.add(mountedOverlay);
-      return [
-        // Zero-size anchor: its screen origin IS the slot container's origin.
-        /* @__PURE__ */ jsx(
-          "box",
-          {
-            position: "absolute",
-            left: 0,
-            top: 0,
-            width: 0,
-            height: 0,
-            zIndex: 1,
-            ref: (anchorRenderable) => {
-              mountedOverlay.anchorBox = anchorRenderable ?? null;
-              patchOverlay(mountedOverlay);
-            }
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "box",
-          {
-            position: "absolute",
-            zIndex: 1e3,
-            ref: (positionRenderable) => {
-              mountedOverlay.positionBox = positionRenderable ?? null;
-              patchOverlay(mountedOverlay);
-            },
-            children: /* @__PURE__ */ jsx(
-              "text",
-              {
-                fg: mutedColor,
-                ref: (textRenderable) => {
-                  mountedOverlay.suffixText = textRenderable ?? null;
-                  patchOverlay(mountedOverlay);
+      return /* @__PURE__ */ jsx(
+        "box",
+        {
+          width: 0,
+          height: 0,
+          focusable: false,
+          ref: (anchorRenderable) => {
+            mountedOverlay.anchorBox = anchorRenderable ?? null;
+            patchOverlay(mountedOverlay);
+          },
+          children: /* @__PURE__ */ jsx(
+            "box",
+            {
+              position: "absolute",
+              left: 0,
+              top: 0,
+              zIndex: 1e3,
+              ref: (positionRenderable) => {
+                mountedOverlay.positionBox = positionRenderable ?? null;
+                patchOverlay(mountedOverlay);
+              },
+              children: /* @__PURE__ */ jsx(
+                "text",
+                {
+                  fg: mutedColor,
+                  ref: (textRenderable) => {
+                    mountedOverlay.suffixText = textRenderable ?? null;
+                    patchOverlay(mountedOverlay);
+                  }
                 }
-              }
-            )
-          }
-        )
-      ];
+              )
+            }
+          )
+        }
+      );
     },
     refresh() {
-      for (const overlay of mountedOverlays) patchOverlay(overlay);
+      for (const overlay of [...mountedOverlays]) {
+        if (overlay.suffixText?.isDestroyed === true) {
+          mountedOverlays.delete(overlay);
+          continue;
+        }
+        patchOverlay(overlay);
+      }
     }
   };
 }
@@ -2747,7 +2777,11 @@ function describeThrownValue(thrown) {
 }
 
 // src/probe-log.ts
-var PROBE_PATH = join2(dirname(fileURLToPath(import.meta.url)), "..", "probe-slot-errors.txt");
+var PROBE_DIRECTORY = join2(dirname(fileURLToPath(import.meta.url)), "..");
+var PROBE_PATH = join2(PROBE_DIRECTORY, "probe-slot-errors.txt");
+function probeFilePath(fileName) {
+  return join2(PROBE_DIRECTORY, fileName);
+}
 function recordFailure(stage, thrown) {
   try {
     fs.appendFileSync(PROBE_PATH, `${(/* @__PURE__ */ new Date()).toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} stage=${stage}
@@ -2820,14 +2854,15 @@ function registerKeymap(context, deps) {
   try {
     const layerResult = keymap.layer(() => ({
       mode: "global",
-      // Only dispatch while the composer textarea itself has focus.
-      target: () => deps.bridge.current(),
-      // Deliberately independent of store state: the host evaluates `enabled`
-      // reactively, and the store's state is plain mutable data (not a signal),
-      // so a `hasSuggestion()` read here froze the layer at its first value —
-      // false — and the shortcuts never dispatched again. Suggestibility is
-      // re-checked inside each run(), where it costs nothing and is always live.
-      enabled: () => !isHostOverlayMode(keymap),
+      // NO `target` and NO `enabled` here. The host resolves a layer's `target`
+      // thunk to a STATIC reference once, untracked, and REPLACES the layer with
+      // undefined — i.e. removes it — when that call returns null. `target:
+      // () => deps.bridge.current()` is null until the composer is proven, so
+      // the whole layer was deleted at activation and every shortcut died
+      // (real-machine: Tab/right/ctrl+up/ctrl+down all no-ops). This mirrors the
+      // two working same-host plugins (opencode-autocontinue, opencode-snippets),
+      // which declare only `mode: "global"` + `commands` and gate inside run().
+      // All real gating stays in each run() below.
       commands: [
         {
           id: "history-ghost.accept",
@@ -2944,11 +2979,7 @@ function registerKeymap(context, deps) {
 
 // src/context-probe.ts
 import * as fs2 from "node:fs";
-import * as nodePath2 from "node:path";
-var PROBE_FILE = nodePath2.join(
-  "D:\\workSpace\\python\\aicode\\opencode\\opencode-history-ghost",
-  "probe-context-shape.txt"
-);
+var PROBE_FILE = probeFilePath("probe-context-shape.txt");
 function describeValue(value) {
   if (value === null) return "null";
   if (value === void 0) return "undefined";
@@ -3037,7 +3068,7 @@ var tui_default = Plugin.define({
     try {
       const runtimeRole = context?.ui?.slot ? "client" : "server";
       fs3.appendFileSync(
-        "D:\\workSpace\\python\\aicode\\opencode\\opencode-history-ghost\\probe-runtime-role.txt",
+        probeFilePath("probe-runtime-role.txt"),
         `${(/* @__PURE__ */ new Date()).toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} role=${runtimeRole} bootstrap=${Object.prototype.hasOwnProperty.call(context, "bootstrap")} ui=${typeof context?.ui}
 `
       );
@@ -3180,7 +3211,7 @@ var tui_default = Plugin.define({
             });
             if (registration.suggestionLayerRegistered) keymapCleanup = registration;
           }
-          return ghostLine.renderInlineOverlay();
+          return null;
         }
       });
       if (typeof appSlotResult?.dispose === "function") stopAppSlot = appSlotResult.dispose;
@@ -3200,6 +3231,18 @@ var tui_default = Plugin.define({
     } catch (error) {
       recordFailure("slot.session.composer.top", error);
       console.warn("[opencode-history-ghost] composer slot registration failed:", error);
+    }
+    let stopOverlaySlot;
+    try {
+      const slotResult = context.ui?.slot?.({
+        append: "session.composer.top",
+        render: () => ghostLine.renderInlineOverlay()
+      });
+      if (typeof slotResult?.dispose === "function") stopOverlaySlot = slotResult.dispose;
+      else if (typeof slotResult === "function") stopOverlaySlot = slotResult;
+    } catch (error) {
+      recordFailure("slot.overlay", error);
+      console.warn("[opencode-history-ghost] composer overlay slot registration failed:", error);
     }
     const historyRefreshTimer = setInterval(() => {
       if (disposed) return;
@@ -3224,6 +3267,7 @@ var tui_default = Plugin.define({
       keymapCleanup?.();
       stopAppSlot?.();
       stopComposerSlot?.();
+      stopOverlaySlot?.();
       stopIdentitySlot?.();
     }
     return disposeAll;
