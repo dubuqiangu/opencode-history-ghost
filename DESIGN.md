@@ -3,8 +3,9 @@
 ## 0. 一句话
 
 用户在 OpenCode V2 TUI 输入框打字时，基于历史输入做分层匹配（前缀 > 子串 > fuzzy），
-把最匹配的一条以"幽灵行"显示在输入框正上方（已输入部分正常色 + 建议后缀灰显），
-Tab 接受即用整句替换当前输入；候选可循环，功能可开关，匹配为纯内存亚毫秒级。
+把最匹配的一条以灰字**内联**画在输入框内、光标之后（已输入部分正常色 + 未输入后缀灰显），
+内联无法定位时降级为输入框正上方一行幽灵建议；Tab 接受即用整句替换当前输入；
+候选可循环，功能可开关，匹配为纯内存亚毫秒级。
 
 ## 1. 调研结论（决策依据，详细报告见会话记录）
 
@@ -17,7 +18,8 @@ Tab 接受即用整句替换当前输入；候选可循环，功能可开关，�
 | opencode 源码实证（exp-2） | currentFocusedEditor 可读写输入框；keymap 可绑 Tab 且与 autocomplete mode 天然互斥；session.composer.top slot 可挂幽灵行；~/.local/state/opencode/prompt-history.jsonl（50 条）+ opencode.db（全量用户消息） | 全部采纳 |
 
 **明确不做**：打字后把灰字真插进输入框 buffer（原生不支持，extmark 方案污染提交/撤销语义，
-上游 #2207 有事故记录）。视觉内联是唯一的硬限制，用输入框正上方幽灵行替代。
+上游 #2207 有事故记录）。视觉内联改为**覆盖层**实现：在 `session.composer.top` 上挂 0 尺寸
+anchor + 内嵌绝对定位 `<text>`，不触碰 buffer；内联无法定位时回退到输入框正上方幽灵行。
 
 **反应式决策（defect-1）**：插件侧 node_modules 携带 solid-js / @opentui/solid 的影子副本，
 宿主（v2.0.29）只对预编译单文件 bundle 的 hoisted import 稳定替换自有模块实例
@@ -42,9 +44,9 @@ Tab 接受即用整句替换当前输入；候选可循环，功能可开关，�
        store.onStateChange 触发命令式 patch content/visible + renderer.requestRender()）
 
 Tab → 建议快捷键 layer（独立 append:"app" slot 内注册；mode:"global"，
-        enabled: 有建议 && 开关开 && 宿主非 autocomplete/modal；
-        target: bridge.current() 仅返回身份可证明的 composer；
-         run 级再校验身份、候选快照的全文及光标前缀）
+        **layer 级不设 target/enabled**（宿主只解析一次 thunk，为 null 会整层失效）；
+        门控全部放进命令 run()：每次按键重判身份、候选快照全文及光标前缀、
+        开关与宿主 mode，不满足即 return false 归还按键）
        → editor.replaceText(候选整句)  → suggestion-store.clear()
 命令面板开关 → 同一 app slot 中另一个无绑定按键的 global layer；
                不受候选、总开关状态或 composer 焦点限制
@@ -59,7 +61,7 @@ Tab → 建议快捷键 layer（独立 append:"app" slot 内注册；mode:"globa
 
 ```
 opencode-history-ghost/
-├── index.ts / tui.js   # 仓库根目录入口桥接（file URI 的 Host.resolve 目录探测）
+├── index.ts / tui.js   # 仓库根目录入口桥接（目录式 Host.resolve 探测）
 ├── dist/tui.js         # npm run build:tui 生成的单文件业务 bundle；须随发布交付
 ├── src/
 │   ├── index.ts            # 服务端入口占位（纯 TUI 插件，export {}）
@@ -69,11 +71,17 @@ opencode-history-ghost/
 │   ├── editor-bridge.ts    # currentFocusedEditor 访问 / 双槽包装 / 自愈轮询 / 接受
 │   ├── composer-identity.ts # 私有 Prompt 树 footer marker 身份证明；未知结构 fail-closed
 │   ├── suggestion-store.ts # 命令式状态（候选列表、循环索引、开关）+ onStateChange 监听集
-│   ├── ghost-line.tsx      # 幽灵行 UI 控制器（静态 JSX + ref + 命令式 patch）
-│   └── keymap.ts           # 建议快捷键与独立 palette toggle 两层（返回 cleanup）
+│   ├── ghost-line.tsx      # 候选提示行 UI 控制器（静态 JSX + ref + 命令式 patch）
+│   ├── ghost-overlay.tsx   # 内联后缀的文本数学 + 屏幕几何（纯函数，无渲染）
+│   ├── ghost-overlay-render.tsx # 内联覆盖层：composer.top 0 尺寸 anchor + 绝对定位 <text>
+│   ├── string-width.ts     # 东亚宽度感知的显示格测量（覆盖层定位用）
+│   ├── keymap.ts           # 建议快捷键与独立 palette toggle 两层（返回 cleanup）
+│   ├── probe-log.ts / context-probe.ts / thrown-dump.ts  # 开发期诊断探针（发布前移除）
 ├── scripts/dev-smoke.ts    # 开发冒烟：对本地 DB 跑匹配，只输出计数/长度，*** 全掩码
-├── scripts/verify-install.ps1 # 一键安装自验证（file:// 本地 / github 发布链双模式）
+├── scripts/verify-install.ps1 # 一键安装自验证（github 发布链；维护者另有本地 file 模式）
+├── docs/tui-plugin-pitfalls.md    # TUI 插件开发避坑清单（本仓库实证）
 ├── test/ghost-core.test.ts # 核心单元测试（bun/tsx 双运行时，无框架）
+├── test/ghost-line-inline.test.ts # 内联后缀文本/几何 + 覆盖层挂载冒烟（真实 textarea）
 ├── test/composer-identity.test.ts # 真实 renderer 模拟 Prompt 树身份负例
 ├── test/entry-resolution.test.ts # 根目录 server/tui 入口解析回归
 ├── test/tui-delivery.test.ts # 静态验证真实交付 bundle、external 及桥接（非宿主加载）
@@ -81,9 +89,9 @@ opencode-history-ghost/
 ├── package.json / README.md / LICENSE(MIT) / .gitignore / DESIGN.md / tasks.md
 ```
 
-**file URI 解析边界与交付决策**：服务端与 v2 TUI 配置都写入指向仓库根目录的 file URI 只说明配置已登记；`package.json` 的 `exports["."]` 指向 `src/index.ts`，`exports["./tui"]` 指向 `./dist/tui.js`。当前本地 `@opencode/plugin` SDK 2.0.29 对无包名目录探测根级 `server`/`index` 和 `tui`；故根级 `tui.js` 只转发 `./dist/tui.js`，两种 TUI 解析路径共用同一交付文件。针对 OpenTUI 模式冲突，本项目选用 `npm run build:tui` 生成单文件业务 bundle，发布时必须包含 `dist/tui.js`，将 `@opentui/*`、`solid-js` 和宿主 SDK 外置而非带入影子实例；动态 `bun:sqlite` 是合法的 Bun 运行时导入。研究过的宿主源码为 v2.0.26，不能由此推断真实 v2.0.32 的加载表现。不改变 GitHub 正式安装或改 file URI 为 src 的策略。
+**入口解析边界与交付决策（一键安装）**：用户通过 `opencode plugin add github:dubuqiangu/opencode-history-ghost` 一键安装，不需要也不应登记任何本地 file URI。宿主 `@opencode/plugin` 把 `server`（`exports["."]` → `src/index.ts`）与 `tui`（`exports["./tui"]` → `./dist/tui.js`）当作两个独立入口解析；TUI 进程只加载 `.tui` 入口，server 入口因 `context.ui.slot` 不是函数而提前返回（纯 TUI 插件）。目录式 `Host.resolve` 对无包名目录探测根级 `server`/`index` 和 `tui`，故根级 `tui.js` 只转发 `./dist/tui.js`，两条 TUI 解析路径共用同一交付文件。针对 OpenTUI 模式冲突，本项目选用 `npm run build:tui` 生成单文件业务 bundle，发布时必须包含 `dist/tui.js`，将 `@opentui/*`、`solid-js` 和宿主 SDK 外置而非带入影子实例；动态 `bun:sqlite` 是合法的 Bun 运行时导入。研究过的宿主源码为 v2.0.26 / 本地 SDK 2.0.29，不能由此推断真实 v2.0.32 的加载表现。
 
-此前根级桥接补齐后的真机观察：TUI 曾进入插件加载，但因 OpenTUI 重复设置环境变量 `OPENTUI_FORCE_UNICODE`（现有 mode2026 / 新 mode2027）报错，**未确认可用**。本轮改为同一单文件交付产物后仍未在真机重新验证。`Host.resolve` 只证明定位入口；本地 SDK 的 `Host.load` 回归、交付文件的静态回归和 external 化的 esbuild 构建均不能证明真实宿主能导入 external 或共享 OpenTUI 实例；T11/T12 不因此视为完成。
+**真机状态**：快捷键层与 slot 注册在真机上已被证实生效（`probe-slot-errors.txt` 零 `recordFailure`；用户验收快捷键全部生效）。`Host.resolve` 只证明定位入口；本地 SDK 的 `Host.load` 回归、交付文件的静态回归和 external 化的 esbuild 构建均不能证明真实宿主能导入 external 或共享 OpenTUI 实例；T11/T12 不因此视为完成。
 
 ### 3.1 history-source.ts（写权限：lane A）
 
@@ -283,10 +291,13 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void
   且注册在**独立的全局 `append: "app"` slot** 内：app slot 存活整个 TUI 会话，
   跨会话切换不失效；`session.composer.top` slot 只做纯渲染（defect-2 修复：
   会话作用域注册会在离开会话时销毁 layer 且 once-guard 阻断重注册）。
-- **建议快捷键层**：`mode: "global"`，`target: () => bridge.current()`，
-   `enabled` 仅在开关开启、有建议且宿主 mode 非 `autocomplete`/`modal` 时为真；
-   `target` 仅返回当前身份可证明的 composer。补全弹窗激活时 mode 为 "autocomplete"，
-   本层失效，Tab 归还宿主补全（天然互斥，不抢优先级）。
+- **建议快捷键层**：`mode: "global"`，**layer 级不设 `target` / `enabled`**——
+   宿主只解析一次该 thunk，注册当时为 null（身份未证明/未聚焦）会导致**整层被移除**，
+   快捷键全灭（真机根因，见 `docs/tui-plugin-pitfalls.md` #1）。门控全部放进
+   命令 `run()`：每次按键重判"开关开 && 有建议 && 宿主 mode 非 `autocomplete`/`modal`
+   && 身份可证明且光标前缀与候选快照一致"，不满足即 `return false` 归还按键。
+   补全弹窗激活时宿主 mode 为 "autocomplete"，run 判定失败，Tab 归还宿主补全
+   （天然互斥，不抢优先级）。
 - 建议快捷键层的 commands（store 变更类命令都带 **run 级身份 + 文本一致性校验**：当前
    session 的 marker 结构必须证明聚焦 composer，且其光标前缀 trim 后 === state.input，全文/前缀/offset 与产生候选时的快照一致；
   不匹配即 `return false` 归还按键，对话框文本相同也不能接管）：
@@ -327,6 +338,26 @@ Plugin.define({ id: "history-ghost", setup(context) })
 `{ enabled: true, acceptKey: "tab", minChars: 3, maxCandidates: 5,
 maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
 
+### 3.9 ghost-overlay.tsx / ghost-overlay-render.tsx（内联覆盖层，写权限：lane B）
+
+纯 TUI 视觉内联：把候选相对光标前缀的**未输入后缀**以灰色画在输入框内、光标之后。两层分工：
+- `ghost-overlay.tsx`（`computeInlineSuffixFromPrefix` / `resolveOverlayGeometry`）：**纯函数**，
+  后缀文本数学 + 屏幕几何，不渲染、不导入 solid 原语、不写编辑器。
+- `ghost-overlay-render.tsx`（`createInlineGhostOverlay`）：在 `session.composer.top` 上
+  claim 一个 slot，`renderOverlay()` 返回**单根 0 尺寸正常流 anchor + 内嵌绝对定位 `<text>`**，
+  `refresh()` 命令式 patch 该节点；不创建/销毁/重挂，宿主 reconciler 看不到 churn。
+
+几何契约（真机取证后定案，见 `docs/tui-plugin-pitfalls.md` #2/#3/#4/#5）：
+- **后缀文本与起始格同源**：`resolveCaretPrefixText(editor)` 用 `editBuffer.getTextRange(0, cursorOffset)`
+  按**显示格**取真实前缀（`cursorOffset` 不是码元）；同一前缀再经 `caretCellFromPrefix`（`stringWidth`）
+  推出光标格。**不**把文本取自 `cursorOffset`、位置取自 `logicalCursor` 这两个不同字段。
+- **位置优先 `visualCursor`**：`resolveOverlayGeometry` 优先用原生视口相对的
+  `visualCursor.visualRow/visualCol`（软换行与滚动已计入），仅在缺失时回退到
+  `logicalCursor − scrollY/textBufferView.scrollX`。真机 `EditBufferRenderable` 无
+  `textBufferView`（真属性 `editorView`），故该后备的水平滚动恒为 0，属已知降级。
+- 几何任一必需字段缺失/非有限（screenX/x、width、padding、光标行列）即返回 `null` →
+  覆盖层隐藏，**上方幽灵行保底**。任何异常吞掉，绝不崩宿主。
+
 ## 4. 边界情形
 
 | 情形 | 行为 |
@@ -349,8 +380,8 @@ maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
 
 ## 5. 已知限制（记入 README）
 
-1. 灰字在输入框上方一行而非框内原生内联（V2 API 硬限制，上游 OpenTUI "inline ghost
-   suffix" 是唯一无损升级路径）。
+1. 框内内联覆盖层已实现（`session.composer.top` 绝对覆盖层），但当前宿主真机验收中灰字
+   **仍显示在输入框上方**——内联路径未生效时降级为上方幽灵行，根因待真机诊断。
 2. CJK 宽字符截断按 code units，极端情况视觉不精确。
 3. 历史含敏感信息时建议同样可见于屏幕（历史来自本机 DB，不外发；不做 secret 过滤 v1）。
 4. fuzzy 档对超长历史（>2000 已截断）不保证，且与宿主内置补全的 fuzzysort 阈值策略不同。
@@ -368,7 +399,7 @@ maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
    `bun test/ghost-core.test.ts` 与 `npx tsx test/ghost-core.test.ts` 双运行时全 PASS。
 3. `scripts/dev-smoke.ts`：本机历史只观测 DB 成功加载次数及合并条目数（并非 DB 独立条目数），**候选文本以固定 `***` 全掩码，不输出明文**。无 DB 时显示未验证、可降级 jsonl-only；需真实 DB 门槛时显式加 `--require-real-db`，失败退出非零。默认性能门槛是合成 2000 条非个人历史分别覆盖前缀/子串/fuzzy，预热 100 次后两轮各 101 次 `findCandidates` 取较快轮 p95 <1ms，失败退出非零；不包含 DB 加载、渲染和 I/O，也不保证真实历史或每次调用 <1ms。
   4. `pwsh test/verify-install.test.ps1`：静态解析验证脚本并用临时 fixture 验证错误 URI、仅服务端注册、缺失/无效 v2 TUI 配置、无关配置字段、同数量不同内容以及 exports 指向有效 src 但根入口为空时 Host.resolve 失败的负例，不触碰真实宿主配置或更新宿主。
-    5. `pwsh scripts/verify-install.ps1 -Mode file`：本地开发须临时在服务端 `~/.config/opencode/opencode.json` **及 v2 TUI `~/.config/opencode/cli.json`** 的 `plugins` 数组中分别注册指向当前现存仓库的同一 file URI；仅服务端配置不能证明 TUI 已装，任一缺失、解析失败或指向别处均 FAIL。还调用同一项目本地 SDK 的 `Host.resolve({directory: repoRoot})` 检查根目录 server/tui 是否可解析（不调用 Host.load，不读取历史）；另运行入口 TSX 转换与本地依赖图构建检查。当前 GitHub 安装会在注册项 FAIL，不修改宿主配置。正式 GitHub 注册方式不变；`-Mode github` **会执行 plugin update、更改宿主安装**，仅获许可时运行；两模式各自分别运行 ghost-core、editor-bridge-regression、tui-load-diagnostic、caret-prefix-accept、history-completeness、ghost-remount、composer-identity、history-scan-performance、entry-resolution、tui-delivery、history-reassessment 十一项独立 Bun 进程（后三项用 `bun test`），防 mock 串扰，并检查 PASS 和退出码；其中 `bun test/history-scan-performance.test.ts` 分别使用 112k 行合成大库与 60k 消息/120001 parts NULL 时间夹具验证扫描及响应性。tui-delivery 静态检查真实 `dist/tui.js`，不是 graph-check；GitHub 模式逐项核对 git tracked src/scripts 路径及 SHA256，再比对安装包的 bundle 与根桥接文件哈希。自动 PASS 不是 TUI 真机验收，T11/T12 仍未完成。
+    5. `pwsh scripts/verify-install.ps1 -Mode github`（发布 / 维护者）：**会执行 `plugin update`、更改宿主安装，仅获许可时运行**；逐项运行十一项独立 Bun 进程（ghost-core、editor-bridge-regression、tui-load-diagnostic、caret-prefix-accept、history-completeness、ghost-remount、composer-identity、history-scan-performance、entry-resolution、tui-delivery、history-reassessment；后三项用 `bun test`），防 mock 串扰，并检查 PASS 与退出码；其中 `history-scan-performance` 分别用 112k 行合成大库与 60k 消息/120001 parts NULL 时间夹具验证扫描及响应性。tui-delivery 静态检查真实 `dist/tui.js`，不是 graph-check；github 模式逐项核对 git tracked `src/`/`scripts/` 路径及 SHA256，再比对安装包 bundle 与根桥接文件哈希。自动 PASS 不是 TUI 真机验收，T11/T12 仍未完成。维护者本地另有 `-Mode file`（依赖临时本地挂载，非用户安装路径），本设计以 github 一键安装为准。
 6. 按实际安装来源重启 TUI → 手测清单（见 tasks.md T11），核对是否实际加载与读取 DB。
 7. 对照本 DESIGN 与 tasks.md 收敛检查。
 
