@@ -1,6 +1,3 @@
-// src/tui.tsx
-import { Plugin } from "@opencode/plugin/tui";
-
 // src/history-source.ts
 import * as nodeFs from "node:fs";
 import * as nodeOs from "node:os";
@@ -3020,7 +3017,10 @@ function defaultSettings() {
     excludePrefixes: ["/", "@"]
   };
 }
-var tui_default = Plugin.define({
+function defineGhostPlugin(definition) {
+  return definition;
+}
+var tui_default = defineGhostPlugin({
   id: "history-ghost",
   setup(context) {
     if (typeof context?.ui?.slot !== "function") return;
@@ -3214,5 +3214,6 @@ var tui_default = Plugin.define({
   }
 });
 export {
-  tui_default as default
+  tui_default as default,
+  defineGhostPlugin
 };

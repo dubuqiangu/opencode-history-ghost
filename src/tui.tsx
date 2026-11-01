@@ -22,7 +22,6 @@
 // primitive is imported anywhere in this plugin — see ghost-line.tsx for the
 // module-graph evidence.
 
-import { Plugin } from "@opencode/plugin/tui"
 import { createHistorySource } from "./history-source"
 import { createEditorBridge } from "./editor-bridge"
 import { createComposerIdentity } from "./composer-identity"
@@ -77,7 +76,32 @@ function defaultSettings(): HistoryGhostSettings {
   }
 }
 
-export default Plugin.define({
+/**
+ * Vendored plugin definition helper (opencode-db-insight pattern).
+ *
+ * The host loads a plugin entry with a plain dynamic import and validates
+ * the default export's shape ({ id, setup }) directly — the upstream
+ * `Plugin.define()` is an identity function, so we ship our own instead of
+ * importing @opencode/plugin at runtime. The opencode TUI process does not
+ * resolve `@opencode/plugin` for cache-installed GitHub plugins (the install
+ * lives outside the opencode source tree where the host's copy is bundled),
+ * so a static `import { Plugin } from "@opencode/plugin/tui"` makes the whole
+ * `./tui` entry fail to load in the TUI with "Cannot find package
+ * '@opencode/plugin'". Keeping @opencode/plugin out of the runtime import
+ * graph lets the installed package resolve only the exactly pinned
+ * @opentui/* peer tree.
+ */
+export interface GhostPluginDefinition {
+  readonly id: string
+  readonly setup: (context: any) => Promise<(() => void) | void> | (() => void) | void
+}
+
+/** Identity helper preserving the Plugin.define({...}) call shape. */
+export function defineGhostPlugin(definition: GhostPluginDefinition): GhostPluginDefinition {
+  return definition
+}
+
+export default defineGhostPlugin({
   id: "history-ghost",
   setup(context: any) {
     // The host runs this plugin definition once per process role:

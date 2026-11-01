@@ -100,7 +100,7 @@ test("delivered JS keeps host modules external and bundles local business module
   // Bun's JS parser reports actual import specifiers, not incidental strings or comments.
   const importedModules = new Bun.Transpiler({ loader: "js" }).scanImports(artifactSource)
   const importSpecifiers = importedModules.map((importedModule) => importedModule.path)
-  const requiredHostImports = ["@opentui/core", "@opentui/solid/jsx-runtime", "@opencode/plugin/tui"]
+  const requiredHostImports = ["@opentui/core", "@opentui/solid/jsx-runtime"]
   for (const requiredImport of requiredHostImports) expect(importSpecifiers).toContain(requiredImport)
   expect(importSpecifiers.length).toBeGreaterThanOrEqual(requiredHostImports.length)
   for (const specifier of importSpecifiers) {
