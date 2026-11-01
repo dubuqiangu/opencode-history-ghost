@@ -1,13 +1,15 @@
 # opencode-history-ghost
 
-[OpenCode](https://opencode.ai) V2 TUI 插件：在输入框打字时基于**本机历史输入**给出灰字建议。设计上把未输入的后缀以灰色**内联**画在输入框内、光标之后（挂在 `session.composer.top` 的绝对定位覆盖层）；内联无法定位时**降级**为输入框正上方的一行幽灵建议。按 `Tab` 即用整句替换当前输入。
+[OpenCode](https://opencode.ai) V2 TUI 插件：在输入框打字时基于**本机历史输入**给出灰字建议。建议以灰色**幽灵行**显示在输入框正上方一行（已输入部分正常色 + 未输入后缀灰显）。最初设想的"在输入框内、光标之后画灰色内联后缀"的覆盖层方案，经真机探针证实当前宿主忽略嵌套文本框上的 `position:absolute` `left/top` 写入（见已知限制 #1），故内联覆盖层不可用，**输入框正上方一行**是当前宿主上唯一生效的建议表面。按 `Tab` 即用整句替换当前输入。
 
 ```
+  帮我写一个解析 CSV 的 Python 脚本[灰显后缀]
 ┌──────────────────────────────────────────────────────────────┐
-│ > 帮我写一个解析 CSV 的 Python 脚本▍                          │ ← 输入框（▍光标；其后灰字=未输入后缀）
+│ > 帮我写一个解析 CSV 的 Python 脚本▍                          │ ← 输入框（▍光标）
 └──────────────────────────────────────────────────────────────┘
   候选 / 降级提示行：Tab 接受 · (1/5) ctrl+↑↓ 切换 · Esc 取消
 ```
+（灰字建议渲染在输入框**正上方**一行，不在输入框内、光标之后。）
 
 - **内存匹配**：三层匹配（前缀 > 子串 > fuzzy，与宿主内置补全同款 fuzzysort 引擎）。`dev-smoke.ts` 以 2000 条非个人合成历史分别覆盖三桶，预热后每桶测两轮各 101 次 `findCandidates`，取较快轮 p95，断言 **<1ms/次**；仅覆盖匹配函数，不含加载、渲染及 I/O，也不保证每次调用都低于 1ms。
 - **仅本机数据零外发**：历史只读本机 `opencode.db` 与 `prompt-history.jsonl`，不做任何网络上行，无 IPC、无第三方服务
@@ -35,8 +37,9 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
 
 | 功能 | 入口 | 说明 |
 |---|---|---|
-| 灰字实时建议 | 输入 ≥3 字符（可配） | 优先在输入框内、光标之后显示灰色内联后缀；无法内联时降级为输入框正上方一行灰显建议；逐字延长走增量快路径防闪烁 |
+| 灰字实时建议 | 输入 ≥3 字符（可配） | 在输入框**正上方**一行显示灰显建议（当前宿主上唯一生效的表面；输入框内联覆盖层因宿主忽略绝对定位而不可用，见已知限制 #1）；逐字延长走增量快路径防闪烁 |
 | 接受建议 | `Tab`（可配） | 仅以光标前文本匹配，接受时整句替换当前输入（包括光标后内容），接受后光标落在整句末尾 |
+| 接受建议（右箭头） | `→`（固定） | 第二接受键：仅在光标已到输入末尾时才消费建议，光标在中段的普通右移不受影响 |
 | 候选循环 | `ctrl+↓` / `ctrl+↑` | 在匹配候选间切换，提示行显示 `(n/5)` 计数 |
 | 消除建议 | `Esc` | 同一输入不再重现，继续输入即恢复 |
 | 总开关 | 命令面板 → "History Ghost: 开关历史建议" | 含 toast 反馈；设置持久化于 OpenCode durable storage（键 `history-ghost-settings`），跨实例同步、重启保留 |
@@ -56,7 +59,7 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
 | `enabled` | `true` | 总开关；可用命令面板 "History Ghost: 开关历史建议" 切换 |
 | `acceptKey` | `"tab"` | 接受建议的按键，可配 `"right"`、`"ctrl+y"` 等 |
 | `minChars` | `3` | 触发建议的最小输入长度（trim 后计） |
-| `maxCandidates` | `5` | 每次评估保留的候选上限 |
+| `maxCandidates` | `10` | 每次评估保留的候选上限 |
 | `maxEntries` | `2000` | 从数据源加载的历史条数上限。仅插件启动时生效，运行期修改不热加载（重启 TUI 后生效） |
 | `maxTextLength` | `2000` | 超长文本（如粘贴内容）不进入历史建议。仅插件启动时生效，运行期修改不热加载（重启 TUI 后生效） |
 | `excludePrefixes` | `["/", "@"]` | 命中任一前缀不出建议（宿主命令/引用域） |
@@ -72,7 +75,7 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
 
 ## 排障
 
-1. 安装后**完整重启 TUI**，输入一段历史里出现过的前缀（≥3 字符）：输入框**内、光标之后**应出现灰色内联后缀，或在输入框**上方**出现灰显幽灵行（内联无法定位时的降级形态）。
+1. 安装后**完整重启 TUI**，输入一段历史里出现过的前缀（≥3 字符）：输入框**正上方**应出现一行灰显幽灵建议（当前宿主唯一生效表面）。
 2. 常见症状：
     - **不出建议**：确认光标前输入 ≥3 字符、不以 `/` 或 `@` 开头、历史里确有匹配；
      DB 打不开或 schema 变化时自动降级为 jsonl-only（日志中有一次性 warn，功能不断）。
@@ -86,7 +89,7 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
 
 ## 已知限制
 
-1. **框内内联覆盖层**已按 absolute 覆盖层方案实现（`session.composer.top` 上的 0 尺寸 anchor + 内嵌绝对定位 `<text>`），并在真实 `TextareaRenderable` 冒烟测试中确认能绘入字符帧；但**当前宿主真机验收中灰色建议仍显示在输入框上方**——内联路径未生效时自动降级为上方幽灵行，根因待真机诊断（宿主 slot 的兄弟层级 / zIndex 遮挡或几何假设待定）。降级路径是可靠保底。
+1. **框内内联覆盖层在当前宿主上不可用**。该路径已按 absolute 覆盖层方案实现（`session.composer.top` 上的 0 尺寸 anchor + 内嵌绝对定位 `<text>`），并在真实 `TextareaRenderable` 冒烟测试中确认能绘入字符帧；但**真机探针证据证明当前 opencode 宿主忽略嵌套文本框上的 `position:absolute` `left/top` 写入**：插件写入 `positionBox.top = 1` 后，重读节点 `screenY` 仍停在 anchor 行（50），从未落到 textarea 行（51）——18 次探针确认 `bounds=mismatch`。因此框内内联覆盖层在本宿主版本上**无法渲染**。**决策**：接受该限制，以输入框**正上方一行幽灵建议**（设计里的降级形态）作为唯一建议表面（有效）。框内覆盖层代码路径已在源码中**停用**（未注入 `editorSource`、移除覆盖层 slot）。这是**宿主渲染限制**，不是插件逻辑 bug；若未来宿主尊重绝对定位，覆盖层路径可重新启用。
 2. CJK 宽字符按 code units 截断（每行 100 units），极端情况视觉宽度不精确。
 3. 历史含敏感信息时，建议同样可见于屏幕（历史来自本机 DB，不外发；v1 不做 secret 过滤）。
 4. fuzzy 档只对截断后的历史（≤2000 条）保证，且阈值策略与宿主内置补全的 fuzzysort 用法不同。
@@ -98,7 +101,7 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
 6. 若终端复用器（tmux/screen 等）不区分 ctrl+方向键与普通方向键（两者混同），
     候选循环切换将不可用，其余功能不受影响。
 7. 光标处于中间时只以光标前文本匹配（例如 `abc|XYZ` 匹配 `abcdef`，Tab 后全文为 `abcdef`，光标落在末尾）；SDK 显示单元偏移不能可靠转换为文本边界时安全停用建议，不按 JS 字符索引猜测。该行为已在真实 OpenTUI 测试 renderer 中覆盖 Unicode/多行，真实宿主 T11/T12 仍待人工验收。
-8. **开发期诊断探针**（`src/probe-log.ts` / `src/context-probe.ts`）会在插件根目录写入 `probe-*.txt` 诊断文件；它们属于开发脚手架，**发布前应整体移除**（当前源码仍保留，用于定位真机内联覆盖层问题）。
+8. **开发期诊断探针**（`src/probe-log.ts` / `src/context-probe.ts`）此前会在插件根目录写入 `probe-*.txt` 诊断文件；它们属于开发脚手架，**发布前应整体移除**。用于定位真机内联覆盖层问题的诊断探针**已移除**（见已知限制 #1 的最终判定）。
 
 ## 隐私说明
 
@@ -108,7 +111,7 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
 
 ## 开发
 
-- **发布前必须**运行 `npm run build:tui`，将生成的 `dist/tui.js` 随包交付。项目选定的 OpenTUI 模式冲突应对方式是将本地业务模块打成**单文件**，`@opentui/*`、`solid-js` 和宿主 SDK 保持 external，由宿主提供而不是随包再安装一份。`package.json` 的 `./tui` export 指向 `./dist/tui.js`；根级 `tui.js` 给目录式 `Host.resolve` 做 `export { default } from "./dist/tui.js"` 桥接，两条路径落到同一产物。**任意 `src/` 改动均须重新构建 `dist/tui.js` 并重跑交付测试**，否则旧 bundle 可能仍被实际加载；下面的 graph-check 临时文件**不是**发布产物。`bun:sqlite` 的动态加载是 Bun 运行时合法形式，不要当作未打包的本地业务模块。静态回归不证明真实宿主能解析 external 或共享同一 OpenTUI/Solid 实例，真实 TUI 内联灰字仍未定因，T11/T12 尚未通过。
+- **发布前必须**运行 `npm run build:tui`，将生成的 `dist/tui.js` 随包交付。项目选定的 OpenTUI 模式冲突应对方式是将本地业务模块打成**单文件**，`@opentui/*`、`solid-js` 和宿主 SDK 保持 external，由宿主提供而不是随包再安装一份。`package.json` 的 `./tui` export 指向 `./dist/tui.js`；根级 `tui.js` 给目录式 `Host.resolve` 做 `export { default } from "./dist/tui.js"` 桥接，两条路径落到同一产物。**任意 `src/` 改动均须重新构建 `dist/tui.js` 并重跑交付测试**，否则旧 bundle 可能仍被实际加载；下面的 graph-check 临时文件**不是**发布产物。`bun:sqlite` 的动态加载是 Bun 运行时合法形式，不要当作未打包的本地业务模块。静态回归不证明真实宿主能解析 external 或共享同一 OpenTUI/Solid 实例，真机框内内联覆盖层已被证实在当前宿主上不可用（宿主忽略绝对定位，见已知限制 #1，最终判定已定案），T11/T12 尚未通过。
 - 可做入口 TSX 语法转换（**无 `--bundle`，不遍历完整导入图**；插件根目录执行，零报错为准）：
   ```bash
   npx esbuild src/tui.tsx --loader:.tsx=tsx --jsx=automatic --log-level=error
@@ -129,10 +132,10 @@ opencode plugin add github:dubuqiangu/opencode-history-ghost
   pwsh scripts/verify-install.ps1 -Mode github   # 运行 plugin update，更改宿主安装；须先获许可
   pwsh test/verify-install.test.ps1              # 脚本判据的静态负例测试（不触碰真实宿主）
   ```
-  脚本分进程运行十一项独立 Bun 回归（`ghost-core`、`editor-bridge-regression`、`tui-load-diagnostic`、`caret-prefix-accept`、`history-completeness`、`ghost-remount`、`composer-identity`、`history-scan-performance`、`entry-resolution`、`tui-delivery`、`history-reassessment`），检查退出码及 PASS/FAIL；**不可合并为一条 Bun 测试进程**（模块 mock 会串扰）。交付回归静态检查实际发布文件 `dist/tui.js`（不是 graph-check）、external import 和根级桥接；github 模式按 `plugins` 数组精确匹配 ID，并逐一比对已安装 `src/`、`scripts/` 对应的 git tracked 文件路径与 SHA256，另比对 stamp 中 bundle 与桥接的哈希。这些自动检查**不能代替**重启 TUI 后的人工验收。
+  脚本分进程运行十一项独立 Bun 回归（`ghost-core`、`editor-bridge-regression`、`tui-load-diagnostic`、`caret-prefix-accept`、`history-completeness`、`ghost-remount`、`composer-identity`、`history-scan-performance`、`entry-resolution`、`tui-delivery`、`history-reassessment`），检查退出码及 PASS/FAIL；**不可合并为一条 Bun 测试进程**（模块 mock 会串扰）。此十一项仅指安装自验证集合；仓库另有 `test/` 下的独立测试（如 `ghost-line-inline`、`passes-min-input`、`matcher-priority`、`tui-reload-registry`）**不在**该安装清单内，可单独用 `bun test` 运行。交付回归静态检查实际发布文件 `dist/tui.js`（不是 graph-check）、external import 和根级桥接；github 模式按 `plugins` 数组精确匹配 ID，并逐一比对已安装 `src/`、`scripts/` 对应的 git tracked 文件路径与 SHA256，另比对 stamp 中 bundle 与桥接的哈希。这些自动检查**不能代替**重启 TUI 后的人工验收。
 - 更多 TUI 插件坑记录见 [`docs/tui-plugin-pitfalls.md`](docs/tui-plugin-pitfalls.md)。
 
-最新复核无新增 P0/P1：B1（后缀文本/位置同源）、B2（软换行改用 `visualCursor`）等已在源码修复并有回归覆盖，P2 双份加载经独立复审判定**非阻塞**（TUI 进程只加载 `.tui` 入口，server 入口无 `ui.slot` 时提前返回）。**仍待完成**：真机框内内联覆盖层验收（当前降级为上方幽灵行，根因未定）、T11/T12 人工验收；并发 WAL 跨页扫描不保证同一快照，真实 DB 与宿主流畅度尚未验证。
+最新复核无新增 P0/P1：B1（后缀文本/位置同源）、B2（软换行改用 `visualCursor`）等已在源码修复并有回归覆盖，P2 双份加载经独立复审判定**非阻塞**（TUI 进程只加载 `.tui` 入口，server 入口无 `ui.slot` 时提前返回）。**框内内联覆盖层已定案为当前宿主不可用**（宿主忽略嵌套文本框绝对定位写入，见已知限制 #1 最终判定；上方幽灵行为唯一部署表面，代码路径已停用）。**仍待完成**：T11/T12 人工验收；并发 WAL 跨页扫描不保证同一快照，真实 DB 与宿主流畅度尚未验证。
 
 ## License
 

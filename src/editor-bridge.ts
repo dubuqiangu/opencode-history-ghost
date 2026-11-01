@@ -30,9 +30,20 @@
 export interface EditBufferLike {
   /** Full editor content (code units, multi-line preserved). */
   readonly plainText: string
-  /** Display-cell caret offset on real OpenTUI textareas. */
+  /**
+   * Display-cell caret offset on real OpenTUI textareas. Kept `readonly` here
+   * because this plugin only ever READS it; the real object's setter is writable
+   * (EditBufferRenderable.cursorOffset has a setter — the SDK's own
+   * InputRenderable.value setter relies on it). acceptFullText deliberately
+   * writes it via a local cast, never loosening this read-only surface.
+   */
   readonly cursorOffset: number
-  /** Native buffer offsets are display cells (including line breaks). */
+  /**
+   * Native buffer offsets are display cells (including line breaks).
+   * `measureText(text)` returns the display-cell offset of the END of a string
+   * (counting CJK/emoji/tab as their on-screen widths) — the same convention
+   * cursorOffset uses, so acceptFullText reuses it to park the caret.
+   */
   readonly editBuffer?: { measureText(text: string): number; getTextRange(start: number, end: number): string }
   /** Replaces the whole buffer content while preserving undo history. */
   replaceText(text: string): void
@@ -442,6 +453,18 @@ export function createEditorBridge(context: unknown, identity: { resolve(): Edit
       if (!editor) return false
       try {
         editor.replaceText(text)
+        // replaceText preserves undo but does NOT move the caret; the native
+        // buffer leaves it wherever it last was (front). Position it at the end
+        // of the accepted text in DISPLAY CELLS — the SDK's offset convention
+        // (the SDK's own InputRenderable.value setter does the same via
+        // editBuffer.getEOL().offset; we reuse measureText which is its sibling).
+        const buffer = editor.editBuffer
+        if (buffer && typeof buffer.measureText === "function") {
+          const editableCursor = editor as EditBufferLike & { cursorOffset: number }
+          if (typeof editableCursor.cursorOffset === "number") {
+            editableCursor.cursorOffset = buffer.measureText(text)
+          }
+        }
         return true
       } catch (error) {
         warnOnce("failed to write the accepted suggestion into the editor:", error)

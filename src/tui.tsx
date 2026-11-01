@@ -22,7 +22,6 @@
 // primitive is imported anywhere in this plugin — see ghost-line.tsx for the
 // module-graph evidence.
 
-import * as fs from "node:fs"
 import { Plugin } from "@opencode/plugin/tui"
 import { createHistorySource } from "./history-source"
 import { createEditorBridge } from "./editor-bridge"
@@ -31,11 +30,39 @@ import { createSuggestionStore, type HistoryGhostSettings } from "./suggestion-s
 import { createGhostLine } from "./ghost-line"
 import { registerKeymap } from "./keymap"
 
-import { probeContextShape } from "./context-probe"
-import { recordEvent, recordFailure, probeFilePath } from "./probe-log"
+import { recordFailure } from "./probe-log"
 
 /** History-source refresh cadence (jsonl mtime poll, DESIGN §2). */
 const HISTORY_REFRESH_INTERVAL_MS = 3000
+
+/**
+ * Hot-reload registry (tleclaire/opencode-autocomplete approach, DESIGN §3.7).
+ *
+ * The host may re-run setup() on the same process (plugin reload, live-sync,
+ * config touch) without first tearing down the previous instance. Timers,
+ * listener wrappers, slots and keymap layers from the old instance would
+ * otherwise stack with the new ones, or silently crash the reload. We keep ONE
+ * disposer per plugin id on globalThis and run it before the new instance
+ * registers, so at most one instance is ever live.
+ */
+const RELOAD_REGISTRY_KEY = "opencode-history-ghost.activeInstance"
+
+function disposeRegisteredInstance(): void {
+  const globalState = globalThis as Record<string, unknown>
+  const previousDispose = globalState[RELOAD_REGISTRY_KEY]
+  if (typeof previousDispose === "function") {
+    try {
+      ;(previousDispose as () => void)()
+    } catch (error) {
+      console.warn("[opencode-history-ghost] failed to dispose previous instance on reload:", error)
+    }
+  }
+}
+
+function registerActiveInstance(dispose: () => void): void {
+  const globalState = globalThis as Record<string, unknown>
+  globalState[RELOAD_REGISTRY_KEY] = dispose
+}
 
 /** Durable-settings defaults (DESIGN §3.8); fresh object per call. */
 function defaultSettings(): HistoryGhostSettings {
@@ -65,19 +92,11 @@ export default Plugin.define({
     // never runs). Bail out explicitly instead of relying on optional chaining.
     if (typeof context?.ui?.slot !== "function") return
 
-    try {
-      // Temporary: records the real host context shape for diagnosis.
-      probeContextShape(context)
-    } catch {}
-    // Temporary: the host runs setup() once per process role. Only the TUI
-    // client gets a `ui` surface; the server-side run must not register UI.
-    try {
-      const runtimeRole = context?.ui?.slot ? "client" : "server"
-      fs.appendFileSync(
-        probeFilePath("probe-runtime-role.txt"),
-        `${new Date().toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} role=${runtimeRole} bootstrap=${Object.prototype.hasOwnProperty.call(context, "bootstrap")} ui=${typeof context?.ui}\n`,
-      )
-    } catch {}
+    // Hot-reload guard: tear down any prior live instance before this one
+    // registers (tleclaire/opencode-autocomplete approach). Only the TUI
+    // client reaches this point; the server role returned above, so we never
+    // dispose the TUI instance from the server process.
+    disposeRegisteredInstance()
 
     // ---- Durable settings (DESIGN §3.8): survives restarts, hot reloads,
     // and live-syncs across running TUI instances. Storage-miss fallback
@@ -111,10 +130,12 @@ export default Plugin.define({
       store: suggestionStore,
       settings,
       theme: context.theme,
-      // The inline grey suffix overlays the proven composer textarea. The
-      // bridge's current() already limits focus to the trusted composer, so it
-      // is the single safe source for the overlay's geometry.
-      editorSource: { currentEditor: () => editorBridge.current() },
+      // The in-box inline overlay is deliberately NOT injected: the real-machine
+      // probe proved this opencode host ignores `position:absolute` left/top
+      // writes on a nested box (writing `top=1` left the node at the anchor row,
+      // never moving it onto the textarea). So the row-above ghost line is the
+      // sole suggestion surface. `editorBridge` is still created below for
+      // caret-prefix matching + accept.
     })
     let observedHistoryEntries = historySource.entries()
     let disposed = false
@@ -252,7 +273,6 @@ export default Plugin.define({
           // Retry on success, not on "we tried once": a failed keymap layer
           // registration must be retryable on the next app render instead of
           // being locked out forever by the `keymapCleanup === undefined` guard.
-          recordEvent("app.render")
           if (keymapCleanup === undefined) {
             const registration = registerKeymap(context, {
               bridge: editorBridge,
@@ -293,26 +313,6 @@ export default Plugin.define({
       console.warn("[opencode-history-ghost] composer slot registration failed:", error)
     }
 
-    // ---- Composer-region overlay: the untyped grey suffix drawn over the
-    // composer itself (方案 B). It MUST be claimed in the composer region, not
-    // `app`: the app slot lays out in normal flow at the bottom of the main
-    // column, so an absolute child there resolves against the wrong container
-    // and never covers the input. The overlay is a zero-size anchor box whose
-    // absolutely-positioned suffix child is offset relative to the anchor
-    // (proven technique: JosXa/opencode-snippets).
-    let stopOverlaySlot: (() => void) | undefined
-    try {
-      const slotResult = context.ui?.slot?.({
-        append: "session.composer.top",
-        render: () => ghostLine.renderInlineOverlay(),
-      })
-      if (typeof slotResult?.dispose === "function") stopOverlaySlot = slotResult.dispose
-      else if (typeof slotResult === "function") stopOverlaySlot = slotResult
-    } catch (error) {
-      recordFailure("slot.overlay", error)
-      console.warn("[opencode-history-ghost] composer overlay slot registration failed:", error)
-    }
-
     // ---- History refresh: jsonl mtime poll covers prompts that were just
     // submitted but are not in the DB yet (DESIGN §2).
     const historyRefreshTimer = setInterval(() => {
@@ -341,9 +341,12 @@ export default Plugin.define({
       keymapCleanup?.()
       stopAppSlot?.()
       stopComposerSlot?.()
-      stopOverlaySlot?.()
       stopIdentitySlot?.()
     }
+
+    // Register this instance as the live one so a later reload disposes it
+    // before stacking a new instance (hot-reload registry).
+    registerActiveInstance(disposeAll)
 
     return disposeAll
   },

@@ -3,8 +3,9 @@
 ## 0. 一句话
 
 用户在 OpenCode V2 TUI 输入框打字时，基于历史输入做分层匹配（前缀 > 子串 > fuzzy），
-把最匹配的一条以灰字**内联**画在输入框内、光标之后（已输入部分正常色 + 未输入后缀灰显），
-内联无法定位时降级为输入框正上方一行幽灵建议；Tab 接受即用整句替换当前输入；
+把最匹配的一条以灰字**幽灵行**画在输入框正上方一行（已输入部分正常色 + 未输入后缀灰显；
+最初设想的"输入框内、光标之后灰字内联"覆盖层方案，经真机探针证实当前宿主忽略嵌套文本框绝对定位写入而不可用，见 §3.9 与 §5），
+Tab 接受即用整句替换当前输入；
 候选可循环，功能可开关，匹配为纯内存亚毫秒级。
 
 ## 1. 调研结论（决策依据，详细报告见会话记录）
@@ -18,8 +19,11 @@
 | opencode 源码实证（exp-2） | currentFocusedEditor 可读写输入框；keymap 可绑 Tab 且与 autocomplete mode 天然互斥；session.composer.top slot 可挂幽灵行；~/.local/state/opencode/prompt-history.jsonl（50 条）+ opencode.db（全量用户消息） | 全部采纳 |
 
 **明确不做**：打字后把灰字真插进输入框 buffer（原生不支持，extmark 方案污染提交/撤销语义，
-上游 #2207 有事故记录）。视觉内联改为**覆盖层**实现：在 `session.composer.top` 上挂 0 尺寸
+上游 #2207 有事故记录）。视觉内联原按**覆盖层**实现：在 `session.composer.top` 上挂 0 尺寸
 anchor + 内嵌绝对定位 `<text>`，不触碰 buffer；内联无法定位时回退到输入框正上方幽灵行。
+**定案**：真机探针证明当前宿主**忽略嵌套文本框上的 `position:absolute` `left/top` 写入**（写
+`top=1` 后 `screenY` 仍停在 anchor 行），故覆盖层方案在本宿主不可用，已**停用**；输入框正上方
+幽灵行为当前唯一部署表面（见 §3.9 与 §5）。
 
 **反应式决策（defect-1）**：插件侧 node_modules 携带 solid-js / @opentui/solid 的影子副本，
 宿主（v2.0.29）只对预编译单文件 bundle 的 hoisted import 稳定替换自有模块实例
@@ -140,7 +144,7 @@ import type { HistoryEntry } from "./history-source"
 
 export interface MatchOptions {
   minChars?: number         // 触发最小输入长度，默认 3（兼作防抖）
-  maxCandidates?: number    // 候选上限，默认 5
+  maxCandidates?: number    // 候选上限，默认 10
   excludePrefixes?: string[] // 默认 ["/", "@"]，命中任一则不出建议
 }
 
@@ -301,9 +305,14 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): () => void
 - 建议快捷键层的 commands（store 变更类命令都带 **run 级身份 + 文本一致性校验**：当前
    session 的 marker 结构必须证明聚焦 composer，且其光标前缀 trim 后 === state.input，全文/前缀/offset 与产生候选时的快照一致；
   不匹配即 `return false` 归还按键，对话框文本相同也不能接管）：
+  - 层内新增**显式 `bindings` 数组**，逐一列出全部 5 个带按键的命令 id
+    （accept / accept-forward / cycle-next / cycle-prev / dismiss），保证 discovery 与 dispatch 一致。
   - `history-ghost.accept`，bind = settings.acceptKey（默认 `"tab"`，可配 right/ctrl+y），
      run：无候选 / 一致性校验失败 / 无可信光标前缀 → `return false`
     归还按键；通过则 `acceptFullText(候选.text)` → `store.clear()`，成功即消费事件。
+  - `history-ghost.accept-forward`，bind `"right"`：第二个接受键（非 acceptKey 的替换），
+     **仅在光标已到文本末尾时才消费**（`caretAtTextEnd`），光标在中段的普通右移不受影响；
+     run 同样带身份/一致性校验。
   - `history-ghost.cycle-next` bind `ctrl+down`；`history-ghost.cycle-prev` bind `ctrl+up`
     （均带一致性校验）。
   - `history-ghost.dismiss` bind `escape`（带一致性校验：对话框的第一个 Esc 必须归还给对话框）。
@@ -335,12 +344,12 @@ Plugin.define({ id: "history-ghost", setup(context) })
 
 ### 3.8 settings 默认值
 
-`{ enabled: true, acceptKey: "tab", minChars: 3, maxCandidates: 5,
+`{ enabled: true, acceptKey: "tab", minChars: 3, maxCandidates: 10,
 maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
 
 ### 3.9 ghost-overlay.tsx / ghost-overlay-render.tsx（内联覆盖层，写权限：lane B）
 
-纯 TUI 视觉内联：把候选相对光标前缀的**未输入后缀**以灰色画在输入框内、光标之后。两层分工：
+纯 TUI 视觉内联（**当前宿主上已停用**，见下方"宿主限制定案"）：把候选相对光标前缀的**未输入后缀**以灰色画在输入框内、光标之后。两层分工：
 - `ghost-overlay.tsx`（`computeInlineSuffixFromPrefix` / `resolveOverlayGeometry`）：**纯函数**，
   后缀文本数学 + 屏幕几何，不渲染、不导入 solid 原语、不写编辑器。
 - `ghost-overlay-render.tsx`（`createInlineGhostOverlay`）：在 `session.composer.top` 上
@@ -355,8 +364,21 @@ maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
   `visualCursor.visualRow/visualCol`（软换行与滚动已计入），仅在缺失时回退到
   `logicalCursor − scrollY/textBufferView.scrollX`。真机 `EditBufferRenderable` 无
   `textBufferView`（真属性 `editorView`），故该后备的水平滚动恒为 0，属已知降级。
-- 几何任一必需字段缺失/非有限（screenX/x、width、padding、光标行列）即返回 `null` →
-  覆盖层隐藏，**上方幽灵行保底**。任何异常吞掉，绝不崩宿主。
+- **null 硬失败字段**为 screenX/x、width、光标行列：任一缺失/非有限即返回 `null` →
+  覆盖层隐藏，**上方幽灵行保底**。**padding 不属于硬失败字段**：宿主仅对显式设置的那条边
+  返回可用值，`padding`/`paddingX` 简写在真机 prompt textarea 上让另一条边读出
+  `{ unit: Undefined, value: NaN }`，且 `Renderable` 无 computed-padding getter——
+  故未知 padding 一律**降级为 0**（后缀从编辑器自身屏幕原点起格，仍落在正确格，
+  略左于精确文本起点也远好于永不渲染），绝不因 padding 未知而永久隐藏覆盖层。
+  任何异常吞掉，绝不崩宿主。
+
+> **宿主限制定案（真机探针证据）**：尽管上面几何数学成立，真机探针证明当前 opencode 宿主
+> **忽略嵌套文本框上的 `position:absolute` `left/top` 写入**——插件写入 `positionBox.top = 1`
+> 后，重读节点 `screenY` 仍停在 anchor 行（50），从未落到 textarea 行（51），18 次探针确认
+> `bounds=mismatch`。故框内内联覆盖层在当前宿主版本上**无法渲染**，覆盖层路径已在源码**停用**
+> （未注入 `editorSource`、移除覆盖层 slot），部署的建议表面为**输入框正上方一行幽灵建议**。
+> 这是**宿主渲染限制**而非插件逻辑 bug；若未来宿主尊重绝对定位，覆盖层路径可据此几何契约重新启用。
+> 上文几何数学保留为**设计意图**记录。
 
 ## 4. 边界情形
 
@@ -380,8 +402,11 @@ maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
 
 ## 5. 已知限制（记入 README）
 
-1. 框内内联覆盖层已实现（`session.composer.top` 绝对覆盖层），但当前宿主真机验收中灰字
-   **仍显示在输入框上方**——内联路径未生效时降级为上方幽灵行，根因待真机诊断。
+1. **框内内联覆盖层在当前宿主上不可用（定案）**。该路径已实现（`session.composer.top` 绝对覆盖层），
+   但**真机探针证明当前宿主忽略嵌套文本框上的 `position:absolute` `left/top` 写入**：写 `top=1`
+   后重读 `screenY` 仍停在 anchor 行（18 次 `bounds=mismatch`）。故框内内联覆盖层在本宿主版本上
+   **无法渲染**，代码路径已在源码**停用**；**输入框正上方一行幽灵建议是唯一部署表面**（见 3.9 与
+   `src/ghost-overlay.tsx`）。这是宿主渲染限制，非插件逻辑 bug；若未来宿主尊重绝对定位可重新启用。
 2. CJK 宽字符截断按 code units，极端情况视觉不精确。
 3. 历史含敏感信息时建议同样可见于屏幕（历史来自本机 DB，不外发；不做 secret 过滤 v1）。
 4. fuzzy 档对超长历史（>2000 已截断）不保证，且与宿主内置补全的 fuzzysort 阈值策略不同。
@@ -405,7 +430,7 @@ maxEntries: 2000, maxTextLength: 2000, excludePrefixes: ["/", "@"] }`
 
 最新复核未发现新增 P0/P1，可安排受控 T11/T12 宿主真机验收，但目前均未完成。尤其需确认真实 `prompt.footer` 父子链与宿主/插件 OpenTUI 构造器共享；高重复历史同步 OFFSET 启动阻塞 P2 已由 keyset 与逐页让出缓解，oracle SQL 代码级复核已完成，仍待真实 DB 与真机验证；合成夹具 PASS 不保证无索引单页不会阻塞。
 
-当前真实 TUI 灰字缺席的原因尚未确定；独立 Bun 回归与构建/交付静态检查均不能替代 T11/T12，不能据此声明真机已通过。
+框内内联覆盖层已定案为当前宿主不可用（真机探针证明宿主忽略嵌套文本框绝对定位写入，见 §5 与已知限制 #1；输入框正上方幽灵行为唯一部署表面，覆盖层路径已停用）。独立 Bun 回归与构建/交付静态检查均不能替代 T11/T12，不能据此声明真机已通过。
 
 ### 光标语义变更（自动验证，尚待 T11/T12）
 

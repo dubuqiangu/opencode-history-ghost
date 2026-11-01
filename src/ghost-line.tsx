@@ -88,10 +88,16 @@ function computeSegments(
   const extraLineCount = restLines.length
   const multilineNote = extraLineCount > 0 ? ` (+${extraLineCount} 行)` : ""
 
+  // Collapse internal runs of whitespace to a single space before display
+  // (tleclaire preview.ts). History can hold pasted blobs (whole mails, code
+  // blocks) where the first line is itself a run of tabs/spaces; writing those
+  // verbatim floods the row's layout. Display-only — accepting still inserts
+  // the full unmodified text.
+  const collapsedFirstLine = firstLine.replace(/\s+/g, " ")
   const displayFirstLine =
-    firstLine.length > MAX_DISPLAY_CODE_UNITS
-      ? `${firstLine.slice(0, MAX_DISPLAY_CODE_UNITS)}…`
-      : firstLine
+    collapsedFirstLine.length > MAX_DISPLAY_CODE_UNITS
+      ? `${collapsedFirstLine.slice(0, MAX_DISPLAY_CODE_UNITS)}…`
+      : collapsedFirstLine
 
   // Split the displayed line around the typed input's first occurrence in
   // the candidate: prefix matches start at 0, substring matches anywhere;
@@ -99,7 +105,7 @@ function computeSegments(
   let leadingDim = ""
   let typedMatch = ""
   let trailingDim = displayFirstLine
-  const matchStart = candidate.lower.indexOf(inputLower)
+  const matchStart = displayFirstLine.toLowerCase().indexOf(inputLower)
   if (typedInput.length > 0 && matchStart >= 0) {
     leadingDim = displayFirstLine.slice(0, matchStart)
     typedMatch = displayFirstLine.slice(matchStart, matchStart + typedInput.length)
@@ -117,9 +123,12 @@ export interface GhostLineController {
   /** Re-patches the captured renderables from the store's current state. */
   refresh(): void
   /**
-   * Static inline overlay for the `app` slot: the untyped suffix drawn over
-   * the composer in muted grey. Returns null when no editor source was
-   * injected, so callers can mount it unconditionally.
+   * Static inline overlay for the composer-region slot: the untyped suffix
+   * drawn over the input in muted grey. DISABLED: the real-machine probe proved
+   * this opencode host ignores `position:absolute` left/top writes on a nested
+   * box, so the in-box overlay cannot be rendered here and the row-above ghost
+   * line is the sole suggestion surface. `editorSource` is never injected, so
+   * this always returns null — a safe no-op callers may invoke unconditionally.
    */
   renderInlineOverlay(): unknown
 }
@@ -227,3 +236,4 @@ export function createGhostLine(deps: GhostLineDeps): GhostLineController {
     },
   }
 }
+

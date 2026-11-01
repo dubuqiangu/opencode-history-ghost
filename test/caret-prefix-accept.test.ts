@@ -67,6 +67,7 @@ try {
   const layer = layerFactories.map((factory) => factory() as { target?: unknown; enabled?: unknown; commands: Array<{ id: string; run(): unknown }> })
     .find((registeredLayer) => registeredLayer.commands.some((command) => command.id === "history-ghost.accept"))!
   const accept = layer.commands.find((command) => command.id === "history-ghost.accept")!
+  const acceptForward = layer.commands.find((command) => command.id === "history-ghost.accept-forward")!
   // Regression guard for the real-machine root cause: a layer that declares a
   // `target` thunk is resolved ONCE by the host, and the layer is REMOVED when
   // that call yields null (composer not yet proven) — every shortcut then dies.
@@ -87,6 +88,10 @@ try {
   await setCaretBeforeSuffix("abcXYZ", "XYZ")
   check("middle caret evaluates only abc, not XYZ", bridge.caretPrefix() === "abc" && store.state()?.input === "abc" && store.current()?.text === "abcdef")
   check("Tab replaces entire abc|XYZ buffer with abcdef", accept.run() !== false && composer.plainText === "abcdef")
+  // The accepted suggestion must park the caret at the END (display cells),
+  // not leave it at the front where replaceText drops it. measureText is the
+  // buffer's own display-cell measurer, so this stays correct for CJK/emoji.
+  check("Tab parks the caret at the display-cell end", composer.cursorOffset === composer.editBuffer.measureText("abcdef"))
 
   await setCaretBeforeSuffix("abcXYZ", "XYZ")
   composer.moveCursorLeft()
@@ -109,6 +114,9 @@ try {
     await setCaretBeforeSuffix(text, suffix)
     check(`SDK cell offset retrieves prefix for ${JSON.stringify(expectedPrefix)}`, bridge.caretPrefix() === expectedPrefix && store.current()?.text === candidate)
     check(`Tab replaces whole buffer for ${JSON.stringify(expectedPrefix)}`, accept.run() !== false && composer.plainText === candidate)
+    // Caret parks at the display-cell end of the accepted text (the SDK's own
+    // value setter convention). CJK/emoji/tab widths must not skew the offset.
+    check(`Tab parks caret at display-cell end for ${JSON.stringify(expectedPrefix)}`, composer.cursorOffset === composer.editBuffer.measureText(candidate))
   }
 
   await setCaretBeforeSuffix("abcXYZ", "XYZ")
@@ -122,7 +130,29 @@ try {
   composer.cursorOffset = composer.editBuffer.measureText("abc")
   check("stale full text yields Tab even if prefix matches", accept.run() === false && composer.plainText === "abcZZZ" && bridge.caretPrefix() === "abc")
   runIntegrityPollOnce(bridge)
+
+  // ---- history-ghost.accept-forward ("right"): accepts only when the caret
+  // sits at the very end of the text (caretAtTextEnd). At mid-text it must
+  // yield false so ordinary caret movement keeps working.
   await setCaretBeforeSuffix("abcXYZ", "XYZ")
+  check("right at mid-text yields the key (no accept)", acceptForward.run() === false && composer.plainText === "abcXYZ")
+  // Caret at the end of the text with a live suggestion accepts and replaces.
+  // Drive the store through a DIFFERENT intermediate input first ("ab", too
+  // short) so the final "abc" at end-text COMMITS a fresh state change; that
+  // commit re-captures the keymap's candidateSnapshot at the end caret.
+  await setCaretBeforeSuffix("ab", "")
+  await setCaretBeforeSuffix("abc", "")
+  check("right at end-text accepts the whole buffer", acceptForward.run() !== false && composer.plainText === "abcdef")
+  // The same right path also clears the suggestion (store no longer shows it).
+  check("right accept clears the suggestion", store.state() === null)
+  // With the suggestion consumed, a second right at the same end-caret now has
+  // no live candidate and yields the key back to the host.
+  check("right with no live suggestion yields the key", acceptForward.run() === false && composer.plainText === "abcdef")
+
+  // Reset to a mid-caret state with the original "abcXYZ" text before the
+  // remaining host-overlay checks.
+  await setCaretBeforeSuffix("abcXYZ", "XYZ")
+
   inputMode = "autocomplete"
   check("host autocomplete owns Tab", accept.run() === false && composer.plainText === "abcXYZ")
   inputMode = "modal"

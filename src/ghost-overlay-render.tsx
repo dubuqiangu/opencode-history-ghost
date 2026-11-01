@@ -246,16 +246,25 @@ export function createInlineGhostOverlay(deps: InlineGhostOverlayDeps): InlineGh
       // row above the composer down with it.
       plan = null
     }
-    if (plan && hasContainerOrigin && overlay.originColumn !== null && overlay.originRow !== null) {
-      suffixText.content = plan.text
-      // Plan coordinates are absolute screen cells; left/top are inset from
-      // the slot container, so the container origin is removed here.
-      positionBox.left = plan.x - overlay.originColumn
-      positionBox.top = plan.y - overlay.originRow
-      suffixText.visible = true
-    } else {
+    if (!plan) {
+      // No usable plan: hide the suffix; the row above the composer carries
+      // the suggestion (design degradation contract).
       suffixText.visible = false
+      return
     }
+    if (!hasContainerOrigin || overlay.originColumn === null || overlay.originRow === null) {
+      // No usable container origin: hide the suffix; the row above carries it.
+      suffixText.visible = false
+      return
+    }
+    suffixText.content = plan.text
+    // Plan coordinates are absolute screen cells; left/top are inset from
+    // the slot container, so the container origin is removed here.
+    const left = plan.x - overlay.originColumn
+    const top = plan.y - overlay.originRow
+    positionBox.left = left
+    positionBox.top = top
+    suffixText.visible = true
   }
 
   return {

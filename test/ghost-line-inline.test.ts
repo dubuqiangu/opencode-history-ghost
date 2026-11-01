@@ -38,6 +38,18 @@ function assertEqual<T>(label: string, actualValue: T, expectedValue: T): void {
   if (!matches) failedAssertionCount += 1
 }
 
+// The highlight region (typedMatch) is painted in base color while everything
+// else is dim "gray". Extract just the highlighted text from a rendered line so
+// tests can assert exactly which segment is emphasised, not merely the blob text.
+type RenderedSpan = { text: string; fg: { buffer: ArrayLike<number> } }
+function extractHighlightText(line: { spans: RenderedSpan[] }): string {
+  return line.spans
+    .filter((span) => !(span.fg.buffer[0] === 128 && span.fg.buffer[1] === 128 && span.fg.buffer[2] === 128))
+    .map((span) => span.text)
+    .join("")
+    .trim()
+}
+
 function makeTestSettings(): HistoryGhostSettings {
   return {
     enabled: true,
@@ -178,14 +190,20 @@ function runGeometryCases(): void {
   assertEqual("宽度为 0 → 降级为 null", zeroWidth, null)
   const undefinedWidth = resolveOverlayGeometry(makeGeometrySource({ width: undefined }), targetSuffix, targetCaret)
   assertEqual("宽度为 undefined → 降级为 null", undefinedWidth, null)
+  // Padding is a soft inset: unknown or unparseable padding degrades to 0 (the
+  // suffix is positioned from the editor's own screen origin) rather than
+  // hiding the overlay. This is the real-machine fix — the prompt textarea sets
+  // its padding via shorthand, so `getPadding(Left)` is Unit.Undefined and the
+  // old hard-fail kept the grey suffix permanently invisible.
   const noPadding = resolveOverlayGeometry(makeGeometrySource({ getPadding: undefined }), targetSuffix, targetCaret)
-  assertEqual("拿不到 padding → 降级为 null", noPadding, null)
+  assertEqual("拿不到 padding → 按 0 起算仍能解析", noPadding?.x, makeGeometrySource({}).screenX! + 0 + 3)
+  assertEqual("拿不到 padding → 按 0 起算仍能解析 (y)", noPadding?.y, makeGeometrySource({}).screenY! + 0 + 0)
   const percentPadding = resolveOverlayGeometry(
     makeGeometrySource({ getPadding: () => ({ unit: 2, value: 50 }) }),
     targetSuffix,
     targetCaret,
   )
-  assertEqual("百分比 padding 无法解析 → 降级为 null", percentPadding, null)
+  assertEqual("百分比 padding 无法解析 → 按 0 起算仍能解析", percentPadding?.x, makeGeometrySource({}).screenX! + 0 + 3)
   const destroyedEditor = resolveOverlayGeometry(makeGeometrySource({ isDestroyed: true }), targetSuffix, targetCaret)
   assertEqual("编辑器已销毁 → 降级为 null", destroyedEditor, null)
   const badScroll = resolveOverlayGeometry(makeGeometrySource({ scrollY: Number.NaN }), targetSuffix, targetCaret)
@@ -222,6 +240,65 @@ async function runGhostRowRegression(): Promise<void> {
     const initialFrame = setup.captureCharFrame()
     assertTrue("上方行显示候选原文", initialFrame.includes("hello original candidate"))
     assertTrue("上方行显示接受提示", initialFrame.includes("Tab 接受"))
+
+    // tleclaire preview.ts borrow: a pasted first line with a run of
+    // whitespace is collapsed to single spaces on display, so it cannot flood
+    // the row's layout. Accepting still inserts the full text — the store
+    // entry is untouched, only the row's visual projection collapses.
+    const blobHistory = [
+      { text: "git   push   --force   origin   main", lower: "git   push   --force   origin   main" },
+    ]
+    const blobStore = createSuggestionStore(() => blobHistory, makeTestSettings())
+    blobStore.evaluate("git")
+    const blobGhostLine = createGhostLine({ store: blobStore, settings: makeTestSettings(), theme: undefined })
+    const blobSetup = await testRender(() => blobGhostLine.renderRow(), { width: 110, height: 8 })
+    try {
+      await blobSetup.renderOnce()
+      const blobFrame = blobSetup.captureCharFrame()
+      assertTrue("内嵌空白压成单空格（防撑爆布局）", blobFrame.includes("git push --force origin main"))
+      assertTrue("内嵌空白压成单空格（不保留双空格）", !blobFrame.includes("git  push"))
+      // The rendered row is display-only: the candidate text itself is intact.
+      assertEqual("候选原文未被压空格（接受仍插入原文）", blobStore.current()?.text, "git   push   --force   origin   main")
+    } finally {
+      await blobSetup.dispose()
+    }
+
+    // Regression (P1-1): after the whitespace run collapses to one space, the
+    // highlight region must be computed against the SAME collapsed line that is
+    // sliced. Previously matchStart came from the uncollapsed candidate, so a
+    // substring match after a whitespace run mis-aligned the split (it cut the
+    // word mid-way). A substring input that itself contained a space got -1 and
+    // dropped the highlight entirely. Both must now emphasise the full word.
+    const substringBlob = [
+      { text: "git   push --force origin main", lower: "git   push --force origin main" },
+    ]
+    const substringStore = createSuggestionStore(() => substringBlob, makeTestSettings())
+    substringStore.evaluate("push")
+    const substringGhostLine = createGhostLine({ store: substringStore, settings: makeTestSettings(), theme: undefined })
+    const substringSetup = await testRender(() => substringGhostLine.renderRow(), { width: 110, height: 8 })
+    try {
+      await substringSetup.renderOnce()
+      const substringLine = substringSetup.captureSpans().lines[0]
+      assertTrue("子串命中整词高亮（空白折叠后仍对齐）", extractHighlightText(substringLine) === "push")
+      assertTrue("高亮不把词从中间劈开（leadingDim 不含断词）", !extractHighlightText(substringLine).startsWith("git"))
+    } finally {
+      await substringSetup.dispose()
+    }
+
+    const spacedInputBlob = [
+      { text: "apt   install", lower: "apt   install" },
+    ]
+    const spacedInputStore = createSuggestionStore(() => spacedInputBlob, makeTestSettings())
+    spacedInputStore.evaluate("apt i")
+    const spacedInputGhostLine = createGhostLine({ store: spacedInputStore, settings: makeTestSettings(), theme: undefined })
+    const spacedInputSetup = await testRender(() => spacedInputGhostLine.renderRow(), { width: 110, height: 8 })
+    try {
+      await spacedInputSetup.renderOnce()
+      const spacedInputLine = spacedInputSetup.captureSpans().lines[0]
+      assertTrue("含空格的输入仍产生高亮（不再全灰）", extractHighlightText(spacedInputLine) === "apt i")
+    } finally {
+      await spacedInputSetup.dispose()
+    }
 
     rowStore.evaluate("wor")
     ghostLine.refresh()

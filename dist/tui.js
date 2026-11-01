@@ -1,5 +1,4 @@
 // src/tui.tsx
-import * as fs3 from "node:fs";
 import { Plugin } from "@opencode/plugin/tui";
 
 // src/history-source.ts
@@ -639,6 +638,13 @@ function createEditorBridge(context, identity) {
       if (!editor) return false;
       try {
         editor.replaceText(text);
+        const buffer = editor.editBuffer;
+        if (buffer && typeof buffer.measureText === "function") {
+          const editableCursor = editor;
+          if (typeof editableCursor.cursorOffset === "number") {
+            editableCursor.cursorOffset = buffer.measureText(text);
+          }
+        }
         return true;
       } catch (error) {
         warnOnce("failed to write the accepted suggestion into the editor:", error);
@@ -2386,10 +2392,14 @@ function computeInlineSuffixFromPrefix(textBeforeCaret, candidateText) {
   return { suffix, typedLinePrefix, continuesOnNextLine: newlineIndex !== -1 };
 }
 function paddingCells(editor, edge) {
-  if (typeof editor.getPadding !== "function") return null;
-  const paddingValue = editor.getPadding(edge);
-  if (!paddingValue || paddingValue.unit !== YOGA_POINT_UNIT || !isFiniteNumber(paddingValue.value)) return null;
-  return Math.max(0, Math.trunc(paddingValue.value));
+  if (typeof editor.getPadding !== "function") return 0;
+  try {
+    const paddingValue = editor.getPadding(edge);
+    if (!paddingValue || paddingValue.unit !== YOGA_POINT_UNIT || !isFiniteNumber(paddingValue.value)) return 0;
+    return Math.max(0, Math.trunc(paddingValue.value));
+  } catch {
+    return 0;
+  }
 }
 function numericLayoutValue(value) {
   if (isFiniteNumber(value)) return value;
@@ -2403,9 +2413,8 @@ function resolveOverlayGeometry(editor, inlineSuffix, caretCell) {
   if (textareaX === null || textareaY === null) return null;
   if (textareaWidth === null || textareaWidth <= 0) return null;
   const paddingLeftCells = paddingCells(editor, 0);
-  const paddingRightCells = paddingCells(editor, 2) ?? 0;
+  const paddingRightCells = paddingCells(editor, 2);
   const paddingTopCells = paddingCells(editor, 1);
-  if (paddingLeftCells === null || paddingTopCells === null) return null;
   if (!Number.isSafeInteger(caretCell.row) || caretCell.row < 0) return null;
   if (!isFiniteNumber(caretCell.col) || caretCell.col < 0) return null;
   const visualCursor = editor.visualCursor;
@@ -2545,14 +2554,20 @@ function createInlineGhostOverlay(deps) {
     } catch {
       plan = null;
     }
-    if (plan && hasContainerOrigin && overlay.originColumn !== null && overlay.originRow !== null) {
-      suffixText.content = plan.text;
-      positionBox.left = plan.x - overlay.originColumn;
-      positionBox.top = plan.y - overlay.originRow;
-      suffixText.visible = true;
-    } else {
+    if (!plan) {
       suffixText.visible = false;
+      return;
     }
+    if (!hasContainerOrigin || overlay.originColumn === null || overlay.originRow === null) {
+      suffixText.visible = false;
+      return;
+    }
+    suffixText.content = plan.text;
+    const left = plan.x - overlay.originColumn;
+    const top = plan.y - overlay.originRow;
+    positionBox.left = left;
+    positionBox.top = top;
+    suffixText.visible = true;
   }
   return {
     renderOverlay() {
@@ -2627,11 +2642,12 @@ function computeSegments(settings, suggestionState, candidate) {
   const [firstLine, ...restLines] = candidate.text.split("\n");
   const extraLineCount = restLines.length;
   const multilineNote = extraLineCount > 0 ? ` (+${extraLineCount} \u884C)` : "";
-  const displayFirstLine = firstLine.length > MAX_DISPLAY_CODE_UNITS ? `${firstLine.slice(0, MAX_DISPLAY_CODE_UNITS)}\u2026` : firstLine;
+  const collapsedFirstLine = firstLine.replace(/\s+/g, " ");
+  const displayFirstLine = collapsedFirstLine.length > MAX_DISPLAY_CODE_UNITS ? `${collapsedFirstLine.slice(0, MAX_DISPLAY_CODE_UNITS)}\u2026` : collapsedFirstLine;
   let leadingDim = "";
   let typedMatch = "";
   let trailingDim = displayFirstLine;
-  const matchStart = candidate.lower.indexOf(inputLower);
+  const matchStart = displayFirstLine.toLowerCase().indexOf(inputLower);
   if (typedInput.length > 0 && matchStart >= 0) {
     leadingDim = displayFirstLine.slice(0, matchStart);
     typedMatch = displayFirstLine.slice(matchStart, matchStart + typedInput.length);
@@ -2772,21 +2788,11 @@ function describeThrownValue(thrown) {
 // src/probe-log.ts
 var PROBE_DIRECTORY = join2(dirname(fileURLToPath(import.meta.url)), "..");
 var PROBE_PATH = join2(PROBE_DIRECTORY, "probe-slot-errors.txt");
-function probeFilePath(fileName) {
-  return join2(PROBE_DIRECTORY, fileName);
-}
 function recordFailure(stage, thrown) {
   try {
     fs.appendFileSync(PROBE_PATH, `${(/* @__PURE__ */ new Date()).toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} stage=${stage}
 ${describeThrownValue(thrown)}
 ---
-`);
-  } catch {
-  }
-}
-function recordEvent(stage) {
-  try {
-    fs.appendFileSync(PROBE_PATH, `${(/* @__PURE__ */ new Date()).toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} event=${stage}
 `);
   } catch {
   }
@@ -2856,6 +2862,19 @@ function registerKeymap(context, deps) {
       // two working same-host plugins (opencode-autocontinue, opencode-snippets),
       // which declare only `mode: "global"` + `commands` and gate inside run().
       // All real gating stays in each run() below.
+      //
+      // The `bindings` array is declared explicitly as a belt-and-suspenders:
+      // the host also consults it to know these command ids are keyboard
+      // bindings (tleclaire/opencode-autocomplete, whose layer would otherwise
+      // only expose palette entries). It must list exactly the command ids that
+      // carry a `bind` below so discovery and dispatch agree.
+      bindings: [
+        "history-ghost.accept",
+        "history-ghost.accept-forward",
+        "history-ghost.cycle-next",
+        "history-ghost.cycle-prev",
+        "history-ghost.dismiss"
+      ],
       commands: [
         {
           id: "history-ghost.accept",
@@ -2970,75 +2989,26 @@ function registerKeymap(context, deps) {
   return cleanup2;
 }
 
-// src/context-probe.ts
-import * as fs2 from "node:fs";
-var PROBE_FILE = probeFilePath("probe-context-shape.txt");
-function describeValue(value) {
-  if (value === null) return "null";
-  if (value === void 0) return "undefined";
-  const valueType = typeof value;
-  if (valueType === "object" || valueType === "function") {
-    const own = [];
-    const proto = [];
-    try {
-      for (const name of Object.keys(value).slice(0, 40)) own.push(name);
-    } catch {
-    }
-    try {
-      let cursor = Object.getPrototypeOf(value);
-      let depth = 0;
-      while (cursor && depth < 3 && cursor !== Object.prototype) {
-        for (const name of Object.getOwnPropertyNames(cursor)) {
-          if (name === "constructor") continue;
-          if (own.includes(name) || proto.includes(name)) continue;
-          proto.push(name);
-        }
-        cursor = Object.getPrototypeOf(cursor);
-        depth += 1;
-      }
-    } catch {
-    }
-    return `${valueType} own=[${own.join(",")}] proto=[${proto.join(",")}]`;
-  }
-  return `${valueType}`;
-}
-function probeContextShape(context) {
-  const lines = [];
-  lines.push(`=== ${(/* @__PURE__ */ new Date()).toISOString()} pid=${process.pid} ===`);
-  try {
-    const keys = Object.keys(context ?? {});
-    lines.push(`top-level keys: ${keys.join(",")}`);
-    for (const key of keys) {
-      let value;
-      try {
-        value = context[key];
-      } catch (error) {
-        lines.push(`${key}: read threw ${String(error)}`);
-        continue;
-      }
-      lines.push(`${key}: ${describeValue(value)}`);
-    }
-    const ui = context?.ui;
-    if (ui) {
-      lines.push(`ui: ${describeValue(ui)}`);
-      for (const uiKey of Object.keys(ui)) {
-        lines.push(`ui.${uiKey}: ${describeValue(ui[uiKey])}`);
-      }
-    } else {
-      lines.push("ui: ABSENT");
-    }
-  } catch (error) {
-    lines.push(`probe failed: ${String(error)}`);
-  }
-  try {
-    fs2.appendFileSync(PROBE_FILE, lines.join("\n") + "\n");
-  } catch {
-  }
-}
-
 // src/tui.tsx
 import { jsx as jsx3 } from "@opentui/solid/jsx-runtime";
 var HISTORY_REFRESH_INTERVAL_MS = 3e3;
+var RELOAD_REGISTRY_KEY = "opencode-history-ghost.activeInstance";
+function disposeRegisteredInstance() {
+  const globalState = globalThis;
+  const previousDispose = globalState[RELOAD_REGISTRY_KEY];
+  if (typeof previousDispose === "function") {
+    try {
+      ;
+      previousDispose();
+    } catch (error) {
+      console.warn("[opencode-history-ghost] failed to dispose previous instance on reload:", error);
+    }
+  }
+}
+function registerActiveInstance(dispose) {
+  const globalState = globalThis;
+  globalState[RELOAD_REGISTRY_KEY] = dispose;
+}
 function defaultSettings() {
   return {
     enabled: true,
@@ -3054,19 +3024,7 @@ var tui_default = Plugin.define({
   id: "history-ghost",
   setup(context) {
     if (typeof context?.ui?.slot !== "function") return;
-    try {
-      probeContextShape(context);
-    } catch {
-    }
-    try {
-      const runtimeRole = context?.ui?.slot ? "client" : "server";
-      fs3.appendFileSync(
-        probeFilePath("probe-runtime-role.txt"),
-        `${(/* @__PURE__ */ new Date()).toISOString()} pid=${typeof process !== "undefined" ? process.pid : "?"} role=${runtimeRole} bootstrap=${Object.prototype.hasOwnProperty.call(context, "bootstrap")} ui=${typeof context?.ui}
-`
-      );
-    } catch {
-    }
+    disposeRegisteredInstance();
     let resolvedSettings;
     let updateSettings;
     try {
@@ -3092,11 +3050,13 @@ var tui_default = Plugin.define({
     const ghostLine = createGhostLine({
       store: suggestionStore,
       settings,
-      theme: context.theme,
-      // The inline grey suffix overlays the proven composer textarea. The
-      // bridge's current() already limits focus to the trusted composer, so it
-      // is the single safe source for the overlay's geometry.
-      editorSource: { currentEditor: () => editorBridge.current() }
+      theme: context.theme
+      // The in-box inline overlay is deliberately NOT injected: the real-machine
+      // probe proved this opencode host ignores `position:absolute` left/top
+      // writes on a nested box (writing `top=1` left the node at the anchor row,
+      // never moving it onto the textarea). So the row-above ghost line is the
+      // sole suggestion surface. `editorBridge` is still created below for
+      // caret-prefix matching + accept.
     });
     let observedHistoryEntries = historySource.entries();
     let disposed = false;
@@ -3194,7 +3154,6 @@ var tui_default = Plugin.define({
       const appSlotResult = context.ui?.slot?.({
         append: "app",
         render: () => {
-          recordEvent("app.render");
           if (keymapCleanup === void 0) {
             const registration = registerKeymap(context, {
               bridge: editorBridge,
@@ -3225,18 +3184,6 @@ var tui_default = Plugin.define({
       recordFailure("slot.session.composer.top", error);
       console.warn("[opencode-history-ghost] composer slot registration failed:", error);
     }
-    let stopOverlaySlot;
-    try {
-      const slotResult = context.ui?.slot?.({
-        append: "session.composer.top",
-        render: () => ghostLine.renderInlineOverlay()
-      });
-      if (typeof slotResult?.dispose === "function") stopOverlaySlot = slotResult.dispose;
-      else if (typeof slotResult === "function") stopOverlaySlot = slotResult;
-    } catch (error) {
-      recordFailure("slot.overlay", error);
-      console.warn("[opencode-history-ghost] composer overlay slot registration failed:", error);
-    }
     const historyRefreshTimer = setInterval(() => {
       if (disposed) return;
       try {
@@ -3260,9 +3207,9 @@ var tui_default = Plugin.define({
       keymapCleanup?.();
       stopAppSlot?.();
       stopComposerSlot?.();
-      stopOverlaySlot?.();
       stopIdentitySlot?.();
     }
+    registerActiveInstance(disposeAll);
     return disposeAll;
   }
 });

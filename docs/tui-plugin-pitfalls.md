@@ -28,6 +28,13 @@
 - slot render 返回**单个** `JSX.Element`：裸文本要包 `<text>`，`null` 表示不渲染。
 - 同一路径允许**多个独立 claim**（宿主对 `slots.register(path)` 计数）；但它们挂在不同子树，绘制顺序是 claim 顺序而非源码顺序。
 
+> **宿主限制警告（真机探针证据）**：本插件当初正是据此方案在 `session.composer.top` 上做 0 尺寸
+> anchor + 内嵌绝对定位 `<text>` 画框内内联后缀。但**真机探针证明当前 opencode 宿主忽略嵌套文本框上的
+> `position:absolute` `left/top` 写入**：写 `top=1` 后重读节点 `screenY` 仍停在 anchor 行（18 次
+> `bounds=mismatch`），节点从未落到 textarea 行。故该"0 尺寸 anchor + 绝对子节点"技术**在当前宿主上
+> 对嵌套文本框不可靠**，框内内联覆盖层不可用；插件已改以输入框正上方一行幽灵建议为部署表面。
+> 几何契约本身仍成立（作为设计意图），但真机定位被宿主忽略。若未来宿主尊重绝对定位可重试。
+
 涉及：`src/ghost-overlay-render.tsx`。
 
 ---

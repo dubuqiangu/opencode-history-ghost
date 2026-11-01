@@ -143,6 +143,19 @@ export function registerKeymap(context: unknown, deps: KeymapDeps): KeymapRegist
       // two working same-host plugins (opencode-autocontinue, opencode-snippets),
       // which declare only `mode: "global"` + `commands` and gate inside run().
       // All real gating stays in each run() below.
+      //
+      // The `bindings` array is declared explicitly as a belt-and-suspenders:
+      // the host also consults it to know these command ids are keyboard
+      // bindings (tleclaire/opencode-autocomplete, whose layer would otherwise
+      // only expose palette entries). It must list exactly the command ids that
+      // carry a `bind` below so discovery and dispatch agree.
+      bindings: [
+        "history-ghost.accept",
+        "history-ghost.accept-forward",
+        "history-ghost.cycle-next",
+        "history-ghost.cycle-prev",
+        "history-ghost.dismiss",
+      ],
       commands: [
         {
           id: "history-ghost.accept",

@@ -163,12 +163,29 @@ export function computeInlineSuffix(
   return computeInlineSuffixFromPrefix(typedText.slice(0, caretOffset), candidateText)
 }
 
-/** Padding of one edge in whole cells; null when the host does not expose it. */
-function paddingCells(editor: TextareaGeometrySource, edge: number): number | null {
-  if (typeof editor.getPadding !== "function") return null
-  const paddingValue = editor.getPadding(edge)
-  if (!paddingValue || paddingValue.unit !== YOGA_POINT_UNIT || !isFiniteNumber(paddingValue.value)) return null
-  return Math.max(0, Math.trunc(paddingValue.value))
+/**
+ * Padding of one edge in whole cells; 0 when the host does not report it.
+ *
+ * The host only returns a usable value for the EXACT edge that was set
+ * (`@opentui/core` `Renderable.getPadding` reads the specific edge, and a
+ * `padding`/`paddingX` shorthand writes a different edge, leaving e.g.
+ * Edge.Left as `{ unit: Undefined, value: NaN }`), and `Renderable` exposes no
+ * computed-padding getter. Hard-failing on that unknown made the real prompt
+ * textarea (which sets its padding via shorthand) permanently hide the overlay.
+ * Unknown padding is therefore treated as 0: the suffix is positioned from the
+ * editor's own screen origin, so it still lands on the correct grid cell even
+ * when the inset is unknown — and being slightly left of the exact text start
+ * is strictly better than never rendering.
+ */
+function paddingCells(editor: TextareaGeometrySource, edge: number): number {
+  if (typeof editor.getPadding !== "function") return 0
+  try {
+    const paddingValue = editor.getPadding(edge)
+    if (!paddingValue || paddingValue.unit !== YOGA_POINT_UNIT || !isFiniteNumber(paddingValue.value)) return 0
+    return Math.max(0, Math.trunc(paddingValue.value))
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -200,10 +217,13 @@ export function resolveOverlayGeometry(
   const textareaWidth = numericLayoutValue(editor.width)
   if (textareaX === null || textareaY === null) return null
   if (textareaWidth === null || textareaWidth <= 0) return null
+  // Unknown padding degrades to 0 (see paddingCells): the editor's own screen
+  // origin is the caret grid origin, so the suffix still lands on the right
+  // cell. Never hard-fail on it — that permanently hid the overlay on the real
+  // prompt textarea, whose padding is set via shorthand.
   const paddingLeftCells = paddingCells(editor, 0)
-  const paddingRightCells = paddingCells(editor, 2) ?? 0
+  const paddingRightCells = paddingCells(editor, 2)
   const paddingTopCells = paddingCells(editor, 1)
-  if (paddingLeftCells === null || paddingTopCells === null) return null
   if (!Number.isSafeInteger(caretCell.row) || caretCell.row < 0) return null
   if (!isFiniteNumber(caretCell.col) || caretCell.col < 0) return null
 

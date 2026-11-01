@@ -47,6 +47,20 @@ try {
   if (shortcutLayer.commands?.some((command) => command.id === "history-ghost.toggle")) throw new Error("FAIL: duplicate/unreachable palette command on shortcut layer")
   if (paletteLayer.commands?.some((command) => command.bind)) throw new Error("FAIL: palette layer must not bind Tab/Esc/cycle")
   if (paletteLayer.target) throw new Error("FAIL: palette layer must not require composer focus")
+  // The suggestion layer declares its keyboard bindings explicitly so the host
+  // can discover which command ids are keyboard bindings (belt-and-suspenders
+  // alongside each command's `bind`). It must list exactly the five shortcut ids.
+  const expectedBindings = [
+    "history-ghost.accept",
+    "history-ghost.accept-forward",
+    "history-ghost.cycle-next",
+    "history-ghost.cycle-prev",
+    "history-ghost.dismiss",
+  ]
+  const actualBindings = shortcutLayer.bindings ?? []
+  if (JSON.stringify(actualBindings) !== JSON.stringify(expectedBindings)) {
+    throw new Error(`FAIL: suggestion layer bindings = ${JSON.stringify(actualBindings)}, expected ${JSON.stringify(expectedBindings)}`)
+  }
   console.log("PASS: real Solid app slot mounts; SDK-shaped palette-only layer declares the toggle")
 
   // The shortcut layer must stay REACHABLE even with no suggestion: the host
