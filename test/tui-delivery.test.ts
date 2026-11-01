@@ -1,10 +1,14 @@
 /**
  * Project-selected static delivery contract, not an official SDK requirement or
  * proof of host compatibility. Never import or execute the TUI entrypoint here.
- * The v2.0.32 docs example uses JSX peers; this project chooses not to declare
- * them to avoid installing a second OpenTUI instance. Host module sharing has
- * uncovered paths (#55454; related PR not merged), so even external imports
- * and passing tests still require validation in the real host.
+ * The host loads the exports["."] source (src/index.ts -> src/tui.tsx), which
+ * statically imports @opentui/core, @opentui/solid/jsx-runtime and solid-js.
+ * They are therefore declared as peerDependencies pinned to the host version
+ * (matching the working reference opencode-db-insight): npm >=7 auto-installs
+ * peers, so a clean `npm install` from a git spec hoists the host's
+ * @opentui@0.8.0 / solid-js@1.9.17 and they resolve. Without them a clean
+ * install fails in the real host ("Cannot find package '@opentui/solid'").
+ * Even so, passing tests still require validation in the real host.
  */
 import { expect, test } from "bun:test"
 import { existsSync, readFileSync } from "node:fs"
@@ -69,12 +73,24 @@ test("published TUI export and directory-based Host.resolve forward to the same 
   expect(existsSync(artifactPath)).toBe(true)
 })
 
-test("project delivery strategy: omit OpenTUI/Solid install-time dependencies and peers", () => {
-  for (const section of ["dependencies", "peerDependencies", "optionalDependencies"] as const) {
-    for (const dependencyName of Object.keys(packageManifest[section] ?? {})) {
-      expect(dependencyName.startsWith("@opentui/") || dependencyName === "solid-js" || dependencyName.startsWith("solid-js/")).toBe(false)
-    }
-  }
+test("project delivery strategy: declare OpenTUI/Solid peers so a clean git install hoists the host copies", () => {
+  // The host loads the exports["."] source (src/index.ts -> src/tui.tsx), which
+  // statically imports @opentui/core, @opentui/solid/jsx-runtime and solid-js.
+  // Without peerDependencies a clean `npm install` from a git spec cannot resolve
+  // them (real-host log: "Cannot find package '@opentui/solid'"). db-insight is the
+  // working reference: it declares these as peerDependencies pinned to the host version.
+  expect(packageManifest.peerDependencies?.["@opentui/core"]).toBe("0.8.0")
+  expect(packageManifest.peerDependencies?.["@opentui/solid"]).toBe("0.8.0")
+  expect(packageManifest.peerDependencies?.["solid-js"]).toBe("1.9.17")
+  // They must not be regular dependencies: that would pull a second OpenTUI instance
+  // and break instanceof/symbol identity with the host's copy.
+  expect(packageManifest.dependencies?.["@opentui/core"]).toBeUndefined()
+  expect(packageManifest.dependencies?.["@opentui/solid"]).toBeUndefined()
+  expect(packageManifest.dependencies?.["solid-js"]).toBeUndefined()
+  // The host provides @opencode/plugin; fuzzysort is a source runtime import so it
+  // must be a regular dependency for the source entry to resolve it.
+  expect(packageManifest.devDependencies?.["@opencode/plugin"]).toBeDefined()
+  expect(packageManifest.dependencies?.["fuzzysort"]).toBeDefined()
 })
 
 test("delivered JS keeps host modules external and bundles local business modules", () => {

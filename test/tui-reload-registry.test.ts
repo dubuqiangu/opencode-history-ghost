@@ -134,6 +134,6 @@ test("registering a second setup disposes the first instance (reload guard)", as
     // After the second instance is disposed explicitly, its listener also goes.
     expect(secondStore.activeSubscriptionCount()).toBe(0)
   } finally {
-    await testRenderer.dispose()
+    testRenderer.renderer.destroy()
   }
 })

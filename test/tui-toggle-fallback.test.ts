@@ -109,6 +109,6 @@ test("onToggle storage fallback flips in-memory settings and clears suggestions"
     expect(observedStore.capturedSettings!.enabled).toBe(initialState)
     expect(observedStore.clearCount).toBe(clearCountBefore + 2)
   } finally {
-    await testRenderer.dispose()
+    testRenderer.renderer.destroy()
   }
 })

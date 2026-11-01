@@ -105,6 +105,6 @@ try {
   formInput.focus()
   check("form textbox rejected", bridge.current() === null && bridge.acceptFullText("unsafe") === false)
 } finally {
-  bridge.dispose(); identity.dispose(); await setup.dispose()
+  bridge.dispose(); identity.dispose(); setup.renderer.destroy()
 }
 if (failures) process.exitCode = 1

@@ -333,7 +333,7 @@ async function runRealRendererHookScenario(withHostListeners: boolean): Promise<
     bridge?.dispose()
     assertEqual("dispose 恢复宿主 content 槽", textarea.onContentChange, initialContentListener)
     assertEqual("dispose 恢复宿主 cursor 槽", textarea.onCursorChange, initialCursorListener)
-    await testSetup.dispose()
+    testSetup.renderer.destroy()
   }
 }
 
@@ -390,7 +390,7 @@ async function runPluginSlotPipelineScenario(): Promise<void> {
     assertTruthy("真实 renderer + slot 显示固定历史 ghost", testSetup.captureCharFrame().includes("hello from entry pipeline"))
   } finally {
     disposePlugin?.()
-    await testSetup.dispose()
+    testSetup.renderer.destroy()
   }
 }
 

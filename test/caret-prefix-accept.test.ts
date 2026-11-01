@@ -164,7 +164,7 @@ try {
   stopKeymap?.()
   stopInput(); stopCaret(); stopForeign()
   bridge.dispose(); identity.dispose()
-  await setup.dispose()
+  setup.renderer.destroy()
 }
 console.log(failures === 0 ? "测试结论：全部 PASS" : `测试结论：存在 FAIL（${failures} 处）`)
 if (failures > 0) process.exitCode = 1

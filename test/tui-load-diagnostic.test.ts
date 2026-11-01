@@ -91,5 +91,5 @@ try {
   console.log("PASS: toggling the master switch never removes palette access")
 } finally {
   cleanupPlugin?.()
-  await testRenderer.dispose()
+  testRenderer.renderer.destroy()
 }

@@ -83,5 +83,5 @@ try {
     ghost.refresh()
   }
 } finally {
-  await setup.dispose()
+  setup.renderer.destroy()
 }

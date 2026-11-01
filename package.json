@@ -11,8 +11,15 @@
     ".": "./src/index.ts",
     "./tui": "./dist/tui.js"
   },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.23"
+  },
+  "peerDependencies": {
+    "@opentui/core": "0.8.0",
+    "@opentui/solid": "0.8.0",
+    "solid-js": "1.9.17"
+  },
   "dependencies": {
-    "@opencode/plugin": "latest",
     "fuzzysort": "^4.0.2"
   }
 }

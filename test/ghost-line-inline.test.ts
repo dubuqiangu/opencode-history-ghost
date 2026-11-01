@@ -260,7 +260,7 @@ async function runGhostRowRegression(): Promise<void> {
       // The rendered row is display-only: the candidate text itself is intact.
       assertEqual("候选原文未被压空格（接受仍插入原文）", blobStore.current()?.text, "git   push   --force   origin   main")
     } finally {
-      await blobSetup.dispose()
+      blobSetup.renderer.destroy()
     }
 
     // Regression (P1-1): after the whitespace run collapses to one space, the
@@ -282,7 +282,7 @@ async function runGhostRowRegression(): Promise<void> {
       assertTrue("子串命中整词高亮（空白折叠后仍对齐）", extractHighlightText(substringLine) === "push")
       assertTrue("高亮不把词从中间劈开（leadingDim 不含断词）", !extractHighlightText(substringLine).startsWith("git"))
     } finally {
-      await substringSetup.dispose()
+      substringSetup.renderer.destroy()
     }
 
     const spacedInputBlob = [
@@ -297,7 +297,7 @@ async function runGhostRowRegression(): Promise<void> {
       const spacedInputLine = spacedInputSetup.captureSpans().lines[0]
       assertTrue("含空格的输入仍产生高亮（不再全灰）", extractHighlightText(spacedInputLine) === "apt i")
     } finally {
-      await spacedInputSetup.dispose()
+      spacedInputSetup.renderer.destroy()
     }
 
     rowStore.evaluate("wor")
@@ -312,7 +312,7 @@ async function runGhostRowRegression(): Promise<void> {
     await setup.renderOnce()
     assertTrue("清空建议后上方行收起", !setup.captureCharFrame().includes("world replacement candidate"))
   } finally {
-    await setup.dispose()
+    setup.renderer.destroy()
   }
 }
 
@@ -364,7 +364,7 @@ async function runOverlaySmoke(): Promise<void> {
     assertTrue("建议消失后覆盖层 refresh 仍不抛错", true)
     assertTrue("建议消失后灰字后缀从帧中消失", !setup.captureCharFrame().includes("lo smoke candidate"))
   } finally {
-    await setup.dispose()
+    setup.renderer.destroy()
   }
 }
 

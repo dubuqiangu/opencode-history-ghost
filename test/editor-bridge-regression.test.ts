@@ -143,7 +143,7 @@ async function realRendererScenarios(): Promise<void> {
   } finally {
     stopKeymap?.()
     bridge.dispose()
-    await setup.dispose()
+    setup.renderer.destroy()
   }
 }
 
@@ -187,7 +187,7 @@ async function migratedWrapperWithoutHostListener(): Promise<void> {
   } finally {
     console.warn = originalWarn
     bridge.dispose()
-    await setup.dispose()
+    setup.renderer.destroy()
   }
 }
 
